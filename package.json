@@ -12,7 +12,8 @@
     "test": "node --env-file-if-exists=.env --test 'test/*.test.mjs'",
     "eval": "node --env-file-if-exists=.env src/cli/eval.mjs",
     "x402": "node --env-file-if-exists=.env --env-file-if-exists=.local/mps-runtime.env src/x402/server.mjs",
-    "buy": "node --env-file-if-exists=.env src/cli/buy.mjs"
+    "buy": "node --env-file-if-exists=.env src/cli/buy.mjs",
+    "test:x402": "node --test test/x402.test.mjs test/payment.test.mjs"
   },
   "dependencies": {
     "@evolution-sdk/evolution": "0.5.17",

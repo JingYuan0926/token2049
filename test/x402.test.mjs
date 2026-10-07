@@ -1,19 +1,21 @@
 // x402 channel tests. No network: the facilitator, the audit engine and MPS are stubs.
+process.env.X402_ESCROW_ENABLED = 'true';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { PrivateKey } from '@evolution-sdk/evolution';
 import { decodeCardanoTransaction, masumiEscrowAddress, toMasumiSellerSigner, verifyMasumiAuthorization } from '@x402/cardano';
-import { BUYER_SPEND_CONTROLS, ESCROW_ADDRESS, FileMasumiTermsStorage, HttpError, MAX_SPEND_ATOMIC, USDM_ASSET, bodyMatchesQuote, createJournal,
-  findSymlink, parseAuditRequest, quoteProblem, settleFailureIsFinal, termsDigestOf, x402Offer, x402ResultHash } from '../src/x402/core.mjs';
+import { BUYER_SPEND_CONTROLS, ESCROW_ADDRESS, FileMasumiTermsStorage, HttpError, LOVELACE, MAX_SPEND_ATOMIC, PRICE_TADA, bodyDigest,
+  bodyMatchesQuote, contractSize, createJournal, findSymlink, parseAuditRequest, parseQuoteRequest, quoteOptions, quoteProblem,
+  readAikenFolder, reportSummary, settleFailureIsFinal, termsDigestOf, transferMethodOf, x402Offer, x402ResultHash } from '../src/x402/core.mjs';
+import { renderReport } from '../src/engine/report.mjs';
 import { createX402Server } from '../src/x402/server.mjs';
 import { readWalletFile } from '../src/x402/wallet.mjs';
 import { MpsError } from '../src/payment/mps.mjs';
 import { x402Client } from '@x402/core/client';
-import { USDM_PREPROD } from '../src/payment/tiers.mjs';
 
 const MIN = 60_000;
 const sha = (/** @type {string} */ s) => createHash('sha256').update(s, 'utf8').digest('hex');
@@ -22,6 +24,10 @@ const SUPPORTED = { kinds: [{ x402Version: 2, scheme: 'exact', network: 'cardano
   extra: { assetTransferMethods: ['default', 'masumi', 'script'], areFeesSponsored: false, l1Confirmations: { minimum: 0, maximum: 20 } } }],
 extensions: [], signers: { 'cardano:*': [] } };
 const seller = toMasumiSellerSigner({ mnemonic: PrivateKey.generateMnemonic(256), network: 'cardano:preprod' });
+// Stands in for the registered agent's selling wallet, which receives native payments.
+const SELLING_WALLET = toMasumiSellerSigner({ mnemonic: PrivateKey.generateMnemonic(256), network: 'cardano:preprod' }).sellerAddress;
+/** Aiken-like source with this many code lines. Only the line count matters to the price. */
+const codeOf = (/** @type {number} */ lines) => `validator big {\n${'  let x = 1\n'.repeat(lines - 2)}}\n`;
 
 // A minimal, valid Cardano transaction CBOR. Only its id matters to the server.
 function fakeTx(seed = 'ab') {
@@ -31,12 +37,13 @@ function fakeTx(seed = 'ab') {
 }
 
 /** Starts the server on a random port with stubs. */
-async function start({ now = Date.now, audit, mps, settle, verify, prepareWorkspace } = /** @type {any} */ ({})) {
+async function start({ now = Date.now, audit, mps, settle, verify, prepareWorkspace, nativePayTo = SELLING_WALLET } = /** @type {any} */ ({})) {
   const calls = { verify: 0, settle: 0, audit: 0, mps: 0, phases: /** @type {string[]} */ ([]), auditArgs: /** @type {any[]} */ ([]) };
   const stateDir = mkdtempSync(join(tmpdir(), 'x402-test-'));
   /** @type {any} */
   let app;
-  const phaseOf = (/** @type {any} */ req) => app.journal.load(termsDigestOf(req))?.phase;
+  // Escrow jobs are keyed by terms digest, native jobs by transaction id.
+  const phaseOf = (/** @type {any} */ req, /** @type {string} */ txHash) => app.journal.load(req.extra?.terms ? termsDigestOf(req) : txHash)?.phase;
   const facilitator = {
     getSupported: async () => SUPPORTED,
     verify: async () => {
@@ -46,13 +53,13 @@ async function start({ now = Date.now, audit, mps, settle, verify, prepareWorksp
     },
     settle: async (/** @type {any} */ payload, /** @type {any} */ req) => {
       calls.settle += 1;
-      calls.phases.push(`settle:${phaseOf(req)}`);
       const txHash = decodeCardanoTransaction(payload.payload.transaction).txHash;
+      calls.phases.push(`settle:${phaseOf(req, txHash)}`);
       return settle ? settle(txHash) : { success: true, transaction: txHash, network: 'cardano:preprod', extra: { status: 'confirmed', confirmations: 1 } };
     },
   };
   app = createX402Server({
-    facilitator, seller, stateDir, publicUrl: 'http://127.0.0.1:3013', now, log: () => {}, keepAliveMs: 5,
+    facilitator, seller, nativePayTo, stateDir, publicUrl: 'http://127.0.0.1:3013', now, log: () => {}, keepAliveMs: 5,
     ...(prepareWorkspace ? { prepareWorkspace } : {}),
     runAudit: async (/** @type {any} */ args) => {
       calls.audit += 1;
@@ -73,8 +80,8 @@ async function start({ now = Date.now, audit, mps, settle, verify, prepareWorksp
   await app.init();
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${app.server.address().port}`;
-  const post = (/** @type {unknown} */ body, /** @type {Record<string, string>} */ headers = {}) =>
-    fetch(`${base}/audit`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+  const post = (/** @type {unknown} */ body, /** @type {Record<string, string>} */ headers = {}, path = '/audit') =>
+    fetch(`${base}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
   return { app, base, post, calls, stateDir, stop: () => new Promise((resolve) => app.server.close(resolve)) };
 }
 
@@ -90,17 +97,46 @@ async function quoteAndPay(/** @type {any} */ srv, /** @type {any} */ body, seed
 }
 
 const readJob = async (/** @type {Response} */ res) => JSON.parse((await res.text()).trim());
+const decode402 = (/** @type {Response} */ res) => JSON.parse(Buffer.from(/** @type {string} */ (res.headers.get('payment-required')), 'base64').toString('utf8'));
+const encode = (/** @type {unknown} */ value) => Buffer.from(JSON.stringify(value)).toString('base64');
 
 // ---------- prices and requirements ----------
 
-test('tier prices come from tiers.mjs in policyId.assetNameHex form', () => {
-  assert.equal(USDM_ASSET, `${USDM_PREPROD.slice(0, 56)}.${USDM_PREPROD.slice(56)}`);
-  assert.equal(x402Offer('see').amount, '1000000');
-  assert.equal(x402Offer('write').amount, '5000000');
-  assert.equal(MAX_SPEND_ATOMIC, '20000000');
+test('prices are tADA by tier and contract size, the same for both methods', () => {
+  assert.deepEqual(PRICE_TADA, { see: { small: 5, medium: 10, large: 15 }, write: { small: 15, medium: 30, large: 45 } });
+  for (const method of ['native', 'escrow']) {
+    for (const [tier, sizes] of Object.entries(PRICE_TADA)) {
+      for (const [size, tada] of Object.entries(sizes)) {
+        const offer = x402Offer(tier, { size, method });
+        assert.equal(offer.amount, String(tada * 1_000_000));
+        assert.equal(offer.asset, 'lovelace');
+        assert.equal(offer.priceTada, tada);
+        assert.equal(offer.transferMethod, method === 'native' ? 'default' : 'masumi');
+        assert.equal(offer.deadlines === null, method === 'native');
+      }
+    }
+  }
+  assert.equal(MAX_SPEND_ATOMIC, '50000000');
+  assert.ok(Object.values(PRICE_TADA).every((sizes) => Object.values(sizes).every((tada) => tada * 1e6 <= Number(MAX_SPEND_ATOMIC))));
+  assert.throws(() => x402Offer('see', { method: 'card' }), (error) => error instanceof HttpError && error.code === 'invalid_method');
   assert.equal(ESCROW_ADDRESS, masumiEscrowAddress('cardano:preprod'));
   const registration = JSON.parse(readFileSync(new URL('../.local/registration.json', import.meta.url), 'utf8'));
   assert.equal(ESCROW_ADDRESS, registration.smartContractAddress);
+});
+
+test('contract size uses the Sokosumi steps: code lines only, 150 and 400 line limits', () => {
+  const file = (/** @type {string} */ content) => [{ path: 'validators/a.ak', content }];
+  assert.deepEqual(contractSize(file(codeOf(150))), { files: 1, lines: 150, size: 'small' });
+  assert.equal(contractSize(file(codeOf(151))).size, 'medium');
+  assert.equal(contractSize(file(codeOf(400))).size, 'medium');
+  assert.equal(contractSize(file(codeOf(401))).size, 'large');
+  assert.equal(contractSize(file(`// note\n\n${codeOf(150)}\n// end\n`)).size, 'small', 'comments and blank lines do not count');
+  const options = quoteOptions('medium', { native: SELLING_WALLET, escrow: ESCROW_ADDRESS });
+  assert.deepEqual(options.map((o) => [o.id, o.priceTada, o.amount, o.payTo]), [
+    ['see-native', 10, '10000000', SELLING_WALLET], ['see-escrow', 10, '10000000', ESCROW_ADDRESS],
+    ['write-native', 30, '30000000', SELLING_WALLET], ['write-escrow', 30, '30000000', ESCROW_ADDRESS],
+  ]);
+  assert.deepEqual(quoteOptions('small', { native: null, escrow: ESCROW_ADDRESS }).map((o) => o.id), ['see-escrow', 'write-escrow']);
 });
 
 test('escrow deadlines follow tiers.mjs (result due 20 and 45 minutes after the quote)', () => {
@@ -121,20 +157,25 @@ test('result hash is raw MIP-004 with the signed buyer nonce (empty in this flow
   assert.throws(() => x402ResultHash('', '\ud800'));
 });
 
-test('buyer spend controls allow this test USDM up to 20 per payment and nothing else', async () => {
+test('buyer spend controls allow lovelace up to 50 tADA per payment and nothing else', async () => {
   const scheme = { scheme: 'exact', createPaymentPayload: async (/** @type {number} */ x402Version) => ({ x402Version, payload: {} }) };
   const client = new x402Client().register('cardano:preprod', /** @type {any} */ (scheme)).setSpendControls(BUYER_SPEND_CONTROLS);
-  const required = (/** @type {string} */ amount, asset = USDM_ASSET) => ({ x402Version: 2, resource: { url: 'http://x/audit' },
+  const required = (/** @type {string} */ amount, asset = LOVELACE) => ({ x402Version: 2, resource: { url: 'http://x/audit' },
     accepts: [{ scheme: 'exact', network: 'cardano:preprod', amount, asset, payTo: ESCROW_ADDRESS, maxTimeoutSeconds: 600, extra: {} }] });
-  assert.equal((await client.createPaymentPayload(/** @type {any} */ (required('20000000')))).accepted.amount, '20000000');
-  await assert.rejects(client.createPaymentPayload(/** @type {any} */ (required('20000001'))));
+  assert.equal((await client.createPaymentPayload(/** @type {any} */ (required('50000000')))).accepted.amount, '50000000');
+  await assert.rejects(client.createPaymentPayload(/** @type {any} */ (required('50000001'))));
   await assert.rejects(client.createPaymentPayload(/** @type {any} */ (required('1000000', `${'1'.repeat(56)}.00`))));
 });
 
 // ---------- input validation ----------
 
-test('parseAuditRequest accepts code or a GitHub link and rejects everything else', () => {
-  assert.deepEqual(parseAuditRequest({ tier: 'see', code: CODE }), { tier: 'see', source: { kind: 'code', code: CODE }, buyerNotes: '' });
+test('parseAuditRequest accepts code, a GitHub link or uploaded files and rejects everything else', () => {
+  assert.deepEqual(parseAuditRequest({ tier: 'see', code: CODE }), { tier: 'see', method: 'escrow', source: { kind: 'code', code: CODE }, buyerNotes: '' });
+  assert.equal(parseAuditRequest({ tier: 'see', method: 'native', code: CODE }).method, 'native');
+  const files = [{ path: 'validators/a.ak', content: CODE }, { path: 'lib/demo/util.ak', content: 'pub fn f() { 1 }\n' }];
+  assert.deepEqual(parseAuditRequest({ tier: 'write', method: 'escrow', files }).source, { kind: 'files', files });
+  assert.deepEqual(parseQuoteRequest({ code: CODE }), { source: { kind: 'code', code: CODE }, buyerNotes: '' });
+  assert.throws(() => parseQuoteRequest({ tier: 'see', code: CODE }), (error) => error instanceof HttpError && error.code === 'unknown_field');
   const gh = parseAuditRequest({ tier: 'write', github: 'https://github.com/aiken-lang/stdlib', description: 'note' });
   assert.equal(gh.source.kind, 'github');
   assert.equal(gh.buyerNotes, 'note');
@@ -153,6 +194,15 @@ test('parseAuditRequest accepts code or a GitHub link and rejects everything els
     [{ tier: 'see', github: 'https://github.com.evil.io/a/b' }, 400, 'invalid_github'],
     [{ tier: 'see', code: CODE, extra: 1 }, 400, 'unknown_field'],
     [{ tier: 'see', code: CODE, description: 5 }, 400, 'invalid_description'],
+    [{ tier: 'see', method: 'card', code: CODE }, 400, 'invalid_method'],
+    [{ tier: 'see', code: CODE, files: [{ path: 'validators/a.ak', content: CODE }] }, 400, 'invalid_source'],
+    [{ tier: 'see', files: [] }, 400, 'invalid_files'],
+    [{ tier: 'see', files: [{ path: 'validators/../../.env.ak', content: CODE }] }, 400, 'invalid_files'],
+    [{ tier: 'see', files: [{ path: '/etc/passwd.ak', content: CODE }] }, 400, 'invalid_files'],
+    [{ tier: 'see', files: [{ path: 'validators/a.ak', content: CODE, mode: 1 }] }, 400, 'invalid_files'],
+    [{ tier: 'see', files: [{ path: 'validators/a.ak', content: CODE }, { path: 'validators/a.ak', content: CODE }] }, 400, 'invalid_files'],
+    [{ tier: 'see', files: [{ path: 'lib/a.ak', content: CODE }] }, 400, 'invalid_files'],
+    [{ tier: 'see', files: [{ path: 'validators/a.ak', content: 'x'.repeat(200_001) }] }, 413, 'code_too_large'],
     [[], 400, 'invalid_body'],
   ];
   for (const [body, status, code] of bad) {
@@ -177,7 +227,7 @@ test('invalid requests get 4xx before any quote is issued', async () => {
 
 // ---------- the 402 ----------
 
-test('an unpaid POST /audit gets a seller-signed Masumi 402 that a buyer can verify', async () => {
+test('an unpaid escrow POST /audit gets a seller-signed Masumi 402 in tADA that a buyer can verify', async () => {
   const srv = await start();
   try {
     const body = { tier: 'see', code: CODE };
@@ -185,7 +235,9 @@ test('an unpaid POST /audit gets a seller-signed Masumi 402 that a buyer can ver
     assert.equal(res.status, 402);
     const json = await res.json();
     assert.equal(json.error, 'payment_required');
-    assert.equal(json.price.amount, '1000000');
+    assert.equal(json.price.amount, '5000000');
+    assert.equal(json.price.display, '5 tADA');
+    assert.deepEqual(json.project, { label: 'validators/contract.ak (pasted code)', files: 1, lines: 5, size: 'small' });
     const required = JSON.parse(Buffer.from(res.headers.get('payment-required'), 'base64').toString('utf8'));
     assert.equal(required.x402Version, 2);
     assert.equal(required.resource.url, 'http://127.0.0.1:3013/audit');
@@ -194,8 +246,8 @@ test('an unpaid POST /audit gets a seller-signed Masumi 402 that a buyer can ver
     assert.equal(req.scheme, 'exact');
     assert.equal(req.network, 'cardano:preprod');
     assert.equal(req.payTo, ESCROW_ADDRESS);
-    assert.equal(req.asset, USDM_ASSET);
-    assert.equal(req.amount, '1000000');
+    assert.equal(req.asset, 'lovelace');
+    assert.equal(req.amount, '5000000');
     assert.equal(req.maxTimeoutSeconds, 600);
     assert.equal(req.extra.assetTransferMethod, 'masumi');
     assert.equal(req.extra.terms.sellerAddress, seller.sellerAddress);
@@ -217,7 +269,7 @@ test('an unpaid POST /audit gets a seller-signed Masumi 402 that a buyer can ver
     assert.notEqual(again.accepts[0].extra.terms.sellerNonce, req.extra.terms.sellerNonce);
     // The write tier has its own price and a 45-minute result deadline.
     const write = JSON.parse(Buffer.from((await srv.post({ tier: 'write', code: CODE })).headers.get('payment-required'), 'base64').toString('utf8')).accepts[0];
-    assert.equal(write.amount, '5000000');
+    assert.equal(write.amount, '15000000');
     assert.equal(Number(write.extra.terms.submitResultTime) - Number(write.extra.terms.payByTime), 35 * MIN);
   } finally { await srv.stop(); }
 });
@@ -241,7 +293,7 @@ test('server without a seller key answers 503 and reports unavailable', async ()
     assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ok: true });
     assert.equal((await (await fetch(`${base}/availability`)).json()).status, 'unavailable');
     const schema = await (await fetch(`${base}/input_schema`)).json();
-    assert.deepEqual(schema.input_data.map((/** @type {any} */ f) => f.id), ['tier', 'code', 'github', 'description']);
+    assert.deepEqual(schema.input_data.map((/** @type {any} */ f) => f.id), ['tier', 'method', 'code', 'github', 'description']);
     const res = await fetch(`${base}/audit`, { method: 'POST', body: JSON.stringify({ tier: 'see', code: CODE }) });
     assert.equal(res.status, 503);
   } finally { await new Promise((resolve) => app.server.close(resolve)); }
@@ -362,8 +414,8 @@ test('after a restart, settled jobs resume and an unknown MPS outcome is never r
   const stateDir = mkdtempSync(join(tmpdir(), 'x402-recover-'));
   const journal = createJournal(join(stateDir, 'jobs'));
   const base = { tier: 'see', source: { kind: 'code', code: CODE }, buyerNotes: '', txHash: 'e'.repeat(64), escrowTxHash: 'e'.repeat(64),
-    blockchainIdentifier: 'ab', buyerNonce: '', inputHash: 'f'.repeat(64), sellerAddress: seller.sellerAddress, amount: '1000000',
-    asset: USDM_ASSET, payByTime: String(Date.now()), submitResultTime: String(Date.now() + 20 * MIN),
+    blockchainIdentifier: 'ab', buyerNonce: '', inputHash: 'f'.repeat(64), sellerAddress: seller.sellerAddress, amount: '5000000',
+    asset: LOVELACE, payByTime: String(Date.now()), submitResultTime: String(Date.now() + 20 * MIN),
     unlockTime: String(Date.now() + 36 * MIN), externalDisputeUnlockTime: String(Date.now() + 52 * MIN) };
   const settled = 'a'.repeat(64);
   const unknown = 'b'.repeat(64);
@@ -502,7 +554,15 @@ test('a GitHub clone with a symbolic link is refused before the audit reads any 
   const srv = await start({ prepareWorkspace: async () => clone(withLink) });
   try {
     const body = { tier: 'see', github: 'https://github.com/a/b' };
+    // The price check clones first, so a link is refused before any quote or payment.
+    const refused = await srv.post(body);
+    assert.equal(refused.status, 422);
+    assert.match((await refused.json()).message, /symbolic link/);
+    assert.equal(refused.headers.get('payment-required'), null);
+    // A link that appears after the quote is still refused before the audit reads any file.
+    withLink = false;
     const { header } = await quoteAndPay(srv, body);
+    withLink = true;
     const job = await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': header }));
     assert.equal(job.ok, false);
     assert.equal(job.phase, 'failed');
@@ -516,21 +576,32 @@ test('a GitHub clone with a symbolic link is refused before the audit reads any 
   } finally { await srv.stop(); }
 });
 
-test('quoteProblem accepts only this tier\'s price, escrow, seller, deadlines and no registry claim', async () => {
+test('quoteProblem accepts only the option\'s price, payee, method, seller, deadlines and no registry claim', async () => {
   const srv = await start();
   try {
+    const offer = (/** @type {string} */ tier, method = 'escrow', size = 'small') => x402Offer(tier, { size, method });
+    const escrow = { sellerAddress: seller.sellerAddress };
     const { accepted: see } = await quoteAndPay(srv, { tier: 'see', code: CODE });
     const { accepted: write } = await quoteAndPay(srv, { tier: 'write', code: CODE });
-    assert.equal(quoteProblem(see, 'see', seller.sellerAddress), null);
-    assert.equal(quoteProblem(write, 'write', seller.sellerAddress), null);
-    assert.equal(quoteProblem(see, 'write', seller.sellerAddress), 'price');
-    assert.equal(quoteProblem({ ...write, amount: see.amount }, 'see', seller.sellerAddress), 'deadlines');
-    assert.equal(quoteProblem({ ...see, payTo: 'addr_test1other' }, 'see', seller.sellerAddress), 'payTo');
-    assert.equal(quoteProblem({ ...see, asset: `${'1'.repeat(56)}.00` }, 'see', seller.sellerAddress), 'price');
-    assert.equal(quoteProblem({ ...see, network: 'cardano:mainnet' }, 'see', seller.sellerAddress), 'network');
-    assert.equal(quoteProblem(see, 'see', 'addr_test1someoneelse'), 'seller');
+    assert.equal(quoteProblem(see, offer('see'), escrow), null);
+    assert.equal(quoteProblem(write, offer('write'), escrow), null);
+    assert.equal(quoteProblem(see, offer('write'), escrow), 'price');
+    assert.equal(quoteProblem(see, offer('see', 'escrow', 'medium'), escrow), 'price');
+    assert.equal(quoteProblem({ ...write, amount: see.amount }, offer('see'), escrow), 'deadlines');
+    assert.equal(quoteProblem({ ...see, payTo: 'addr_test1other' }, offer('see'), escrow), 'payTo');
+    assert.equal(quoteProblem({ ...see, asset: `${'1'.repeat(56)}.00` }, offer('see'), escrow), 'price');
+    assert.equal(quoteProblem({ ...see, network: 'cardano:mainnet' }, offer('see'), escrow), 'network');
+    assert.equal(quoteProblem(see, offer('see'), { sellerAddress: 'addr_test1someoneelse' }), 'seller');
     const claim = { ...see, extra: { ...see.extra, terms: { ...see.extra.terms, agentIdentifier: 'ab'.repeat(30) } } };
-    assert.equal(quoteProblem(claim, 'see', seller.sellerAddress), 'agentIdentifier');
+    assert.equal(quoteProblem(claim, offer('see'), escrow), 'agentIdentifier');
+
+    const { accepted: native } = await quoteAndPay(srv, { tier: 'see', method: 'native', code: CODE });
+    assert.equal(quoteProblem(native, offer('see', 'native'), { payTo: SELLING_WALLET }), null);
+    assert.equal(quoteProblem(native, offer('see', 'native'), { payTo: 'addr_test1other' }), 'payTo');
+    assert.equal(quoteProblem(native, offer('see', 'native'), {}), 'payTo');
+    assert.equal(quoteProblem(native, offer('see'), escrow), 'payTo');
+    assert.equal(quoteProblem(see, offer('see', 'native'), { payTo: ESCROW_ADDRESS }), 'assetTransferMethod');
+    assert.equal(quoteProblem({ ...native, extra: { ...native.extra, terms: see.extra.terms } }, offer('see', 'native'), { payTo: SELLING_WALLET }), 'assetTransferMethod');
   } finally { await srv.stop(); }
 });
 
@@ -558,4 +629,230 @@ test('file quote storage updates atomically and prunes only unpaid, expired quot
   assert.ok(await storage.get(paid));
   assert.ok(await storage.get(fresh));
   assert.throws(() => storage.path('../etc'), /Invalid terms digest/);
+});
+
+// ---------- native x402 (assetTransferMethod "default") ----------
+
+test('an unpaid native POST /audit gets a plain x402 402 that pays the selling wallet in tADA', async () => {
+  const srv = await start();
+  try {
+    const res = await srv.post({ tier: 'see', method: 'native', code: CODE });
+    assert.equal(res.status, 402);
+    const json = await res.json();
+    assert.equal(json.method, 'native');
+    assert.equal(json.price.display, '5 tADA');
+    const required = decode402(res);
+    assert.equal(required.accepts.length, 1);
+    const req = required.accepts[0];
+    assert.deepEqual([req.scheme, req.network, req.payTo, req.asset, req.amount, req.maxTimeoutSeconds],
+      ['exact', 'cardano:preprod', SELLING_WALLET, 'lovelace', '5000000', 600]);
+    // x402 core leaves "default" off the wire: no method means address-to-address.
+    assert.equal(req.extra.assetTransferMethod, undefined);
+    assert.equal(transferMethodOf(req), 'default');
+    assert.equal(req.extra.terms, undefined);
+    assert.equal(req.extra.inputCommitment, undefined);
+    // The price follows the contract size: a large contract costs 15 tADA (see) and 45 tADA (write).
+    assert.equal(decode402(await srv.post({ tier: 'see', method: 'native', code: codeOf(401) })).accepts[0].amount, '15000000');
+    assert.equal(decode402(await srv.post({ tier: 'write', method: 'native', code: codeOf(401) })).accepts[0].amount, '45000000');
+    assert.equal(readdirSync(join(srv.stateDir, 'terms')).length, 0, 'native quotes store no terms');
+  } finally { await srv.stop(); }
+});
+
+test('a native payment settles, runs the audit, and returns the report with no escrow step', async () => {
+  const srv = await start();
+  try {
+    const body = { tier: 'see', method: 'native', code: CODE, description: 'A vault.' };
+    const { tx, header } = await quoteAndPay(srv, body);
+    const res = await srv.post(body, { 'PAYMENT-SIGNATURE': header });
+    assert.equal(res.status, 200);
+    const settlement = JSON.parse(Buffer.from(/** @type {string} */ (res.headers.get('payment-response')), 'base64').toString('utf8'));
+    assert.equal(settlement.transaction, tx.txHash);
+    const job = await readJob(res);
+    assert.equal(job.ok, true);
+    assert.equal(job.method, 'native');
+    assert.equal(job.phase, 'delivered');
+    assert.deepEqual(job.paymentTx, { hash: tx.txHash, url: `https://preprod.cardanoscan.io/transaction/${tx.txHash}` });
+    assert.deepEqual([job.escrowTx, job.deadlines, job.blockchainIdentifier, job.refund, job.resultTx], [null, null, null, null, null]);
+    assert.deepEqual([job.payment.payTo, job.payment.priceTada, job.payment.assetTransferMethod], [SELLING_WALLET, 5, 'default']);
+    assert.equal(job.resultHash, sha(`;${job.report}`));
+    assert.match(job.report, new RegExp(tx.txHash));
+    assert.match(job.report, /native, address to address/);
+    assert.deepEqual(srv.calls.phases, ['settle:settle-pending']);
+    assert.equal(srv.calls.mps, 0);
+    const saved = srv.app.journal.load(tx.txHash);
+    assert.equal(saved.phase, 'delivered');
+    assert.equal(saved.bodyDigest, bodyDigest(body));
+    assert.equal(JSON.stringify(job).includes('validator vault'), false, 'the response never echoes the code');
+    assert.equal((await (await fetch(`${srv.base}/jobs/${job.jobId}`)).json()).resultHash, job.resultHash);
+  } finally { await srv.stop(); }
+});
+
+test('one native transaction pays for one request: a replay comes from the journal, another body is refused', async () => {
+  const srv = await start();
+  try {
+    const body = { tier: 'see', method: 'native', code: CODE };
+    const { header } = await quoteAndPay(srv, body);
+    const first = await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': header }));
+    const again = await srv.post(body, { 'PAYMENT-SIGNATURE': header });
+    assert.equal(again.status, 200);
+    assert.equal((await readJob(again)).resultHash, first.resultHash);
+    for (const other of [{ ...body, code: `${CODE}\n// other` }, { ...body, tier: 'write' }]) {
+      const res = await srv.post(other, { 'PAYMENT-SIGNATURE': header });
+      assert.equal(res.status, 409);
+      assert.equal((await res.json()).error, 'payment_already_used');
+    }
+    assert.deepEqual([srv.calls.verify, srv.calls.settle, srv.calls.audit], [1, 1, 1]);
+  } finally { await srv.stop(); }
+});
+
+test('a native payment that claims a lower price than the contract size sets is refused before verify', async () => {
+  const srv = await start();
+  try {
+    const body = { tier: 'write', method: 'native', code: codeOf(401) };
+    const { required, accepted, tx } = await quoteAndPay(srv, body);
+    assert.equal(accepted.amount, '45000000');
+    const header = encode({ x402Version: 2, resource: required.resource, accepted: { ...accepted, amount: '15000000' },
+      payload: { transaction: tx.transaction, nonce: tx.nonce } });
+    const res = await srv.post(body, { 'PAYMENT-SIGNATURE': header });
+    assert.equal(res.status, 402);
+    assert.deepEqual([srv.calls.verify, srv.calls.settle, srv.calls.audit], [0, 0, 0]);
+  } finally { await srv.stop(); }
+});
+
+test('a pending native settlement resumes with the same signature; a failed audit says the payment is final', async () => {
+  let pending = true;
+  const srv = await start({ settle: (/** @type {string} */ txHash) => (pending
+    ? { success: false, errorReason: 'settlement_pending', transaction: txHash, network: 'cardano:preprod', extra: { status: 'pending' } }
+    : { success: true, transaction: txHash, network: 'cardano:preprod' }),
+  audit: async () => { throw new Error('aiken crashed'); } });
+  try {
+    const body = { tier: 'see', method: 'native', code: CODE };
+    const { tx, header } = await quoteAndPay(srv, body);
+    const first = await srv.post(body, { 'PAYMENT-SIGNATURE': header });
+    assert.equal(first.status, 402);
+    assert.equal((await first.json()).error, 'settlement_pending');
+    assert.equal(srv.app.journal.load(tx.txHash).phase, 'settle-pending');
+    pending = false;
+    const job = await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': header }));
+    assert.equal(job.ok, false);
+    assert.equal(job.phase, 'failed');
+    assert.match(job.refund, /final/);
+    // x402 core retries a pending settlement once itself, so the first request settles twice.
+    assert.deepEqual([srv.calls.settle, srv.calls.audit, srv.calls.mps], [3, 1, 0]);
+  } finally { await srv.stop(); }
+});
+
+test('a server without the selling wallet answers 503 for native and offers only escrow', async () => {
+  const srv = await start({ nativePayTo: null });
+  try {
+    const res = await srv.post({ tier: 'see', method: 'native', code: CODE });
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error, 'native_not_configured');
+    const quote = await (await srv.post({ code: CODE }, {}, '/quote')).json();
+    assert.deepEqual(quote.options.map((/** @type {any} */ o) => o.id), ['see-escrow', 'write-escrow']);
+    const availability = await (await fetch(`${srv.base}/availability`)).json();
+    assert.equal(availability.x402.methods.native.available, false);
+    assert.equal(availability.x402.methods.escrow.available, true);
+  } finally { await srv.stop(); }
+});
+
+// ---------- POST /quote and uploaded projects ----------
+
+test('POST /quote lists each tier and method with its tADA price, and each 402 matches it', async () => {
+  const srv = await start();
+  try {
+    const res = await srv.post({ code: codeOf(200) }, {}, '/quote');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('payment-required'), null);
+    const json = await res.json();
+    assert.deepEqual(json.project, { label: 'validators/contract.ak (pasted code)', files: 1, lines: 200, size: 'medium' });
+    assert.deepEqual(json.options.map((/** @type {any} */ o) => [o.id, o.tier, o.method, o.priceTada]),
+      [['see-native', 'see', 'native', 10], ['see-escrow', 'see', 'escrow', 10], ['write-native', 'write', 'native', 30], ['write-escrow', 'write', 'escrow', 30]]);
+    assert.ok(json.options.every((/** @type {any} */ o) => o.description.length > 30));
+    for (const o of json.options) {
+      const req = decode402(await srv.post({ tier: o.tier, method: o.method, code: codeOf(200) })).accepts[0];
+      assert.deepEqual([req.amount, req.asset, req.payTo], [o.amount, 'lovelace', o.payTo]);
+    }
+    assert.equal((await srv.post({ tier: 'see', code: CODE }, {}, '/quote')).status, 400);
+    assert.equal(srv.calls.verify + srv.calls.settle, 0);
+  } finally { await srv.stop(); }
+});
+
+test('POST /quote counts against the unpaid quote limit', async () => {
+  const srv = await start();
+  try {
+    for (let i = 0; i < 30; i += 1) assert.equal((await srv.post({ code: CODE }, {}, '/quote')).status, 200);
+    assert.equal((await srv.post({ code: CODE }, {}, '/quote')).status, 429);
+    assert.equal((await srv.post({ tier: 'see', method: 'native', code: CODE })).status, 429);
+  } finally { await srv.stop(); }
+});
+
+test('an uploaded project is priced by all its files and written into the audit workspace', async () => {
+  const work = mkdtempSync(join(tmpdir(), 'x402-work-'));
+  const srv = await start({ prepareWorkspace: async (/** @type {any} */ source, /** @type {string} */ jobId) => {
+    const dir = join(work, jobId);
+    mkdirSync(join(dir, 'validators'), { recursive: true });
+    writeFileSync(join(dir, 'validators/contract.ak'), source.code);
+    return { dir, root: dir, label: 'template' };
+  } });
+  try {
+    const files = [{ path: 'validators/vault.ak', content: CODE }, { path: 'lib/vault/math.ak', content: codeOf(160) }];
+    const quote = await (await srv.post({ files }, {}, '/quote')).json();
+    assert.deepEqual(quote.project, { label: '2 uploaded .ak file(s)', files: 2, lines: 165, size: 'medium' });
+    const body = { tier: 'see', method: 'escrow', files };
+    const { accepted, header } = await quoteAndPay(srv, body);
+    assert.equal(accepted.amount, '10000000');
+    const job = await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': header }));
+    assert.equal(job.ok, true);
+    const { workspace } = srv.calls.auditArgs[0];
+    assert.equal(readFileSync(join(workspace.root, 'validators/vault.ak'), 'utf8'), CODE);
+    assert.equal(readFileSync(join(workspace.root, 'lib/vault/math.ak'), 'utf8'), codeOf(160));
+    assert.equal(existsSync(join(workspace.root, 'validators/contract.ak')), false);
+  } finally { await srv.stop(); }
+});
+
+// ---------- buyer helpers ----------
+
+test('the buyer reads the overall risk and findings from a real report', () => {
+  const report = renderReport({ tier: 'see', label: 'x', inputHash: 'h', model: 'm', date: 'd', files: [{ path: 'validators/a.ak', content: CODE }],
+    check: { ok: true, warnings: 0, passed: 0, tests: 0 }, fix: null, proof: 'proof',
+    review: { overall_risk: 'High', contract_purpose: 'p', summary: 's', checked_patterns: [], design_observations: [], findings: [
+      { severity: 'Low', title: 'Missing doc', location: 'a.ak:1', pattern_id: null, pattern: 'p', description: 'd', impact: 'i', recommendation: 'r' },
+      { severity: 'High', title: 'Anyone | can claim', location: 'a.ak:2', pattern_id: 3, pattern: 'p', description: 'd', impact: 'i', recommendation: 'r' },
+    ] } });
+  assert.deepEqual(reportSummary(report), { overallRisk: 'High',
+    findings: [{ severity: 'High', title: 'Anyone | can claim' }, { severity: 'Low', title: 'Missing doc' }] });
+  assert.deepEqual(reportSummary('not a report'), { overallRisk: null, findings: [] });
+});
+
+test('the buyer sends a local Aiken folder as files and refuses links', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'x402-project-'));
+  writeFileSync(join(dir, 'aiken.toml'), 'name = "a/b"\n');
+  for (const sub of ['validators', 'lib/demo', 'build/packages', '.git']) mkdirSync(join(dir, sub), { recursive: true });
+  writeFileSync(join(dir, 'validators/a.ak'), CODE);
+  writeFileSync(join(dir, 'validators/notes.md'), 'not code');
+  writeFileSync(join(dir, 'lib/demo/util.ak'), 'pub fn f() { 1 }\n');
+  writeFileSync(join(dir, 'build/packages/dep.ak'), 'ignored');
+  assert.deepEqual(readAikenFolder(dir).map((f) => f.path), ['validators/a.ak', 'lib/demo/util.ak']);
+  const demo = readAikenFolder(new URL('../demo', import.meta.url).pathname);
+  assert.deepEqual(demo.map((f) => f.path), ['validators/marketplace.ak', 'validators/vesting.ak']);
+  assert.throws(() => readAikenFolder(mkdtempSync(join(tmpdir(), 'x402-empty-'))), /aiken\.toml/);
+  const outside = join(mkdtempSync(join(tmpdir(), 'x402-secret-')), 'key.ak');
+  writeFileSync(outside, 'secret');
+  symlinkSync(outside, join(dir, 'validators/b.ak'));
+  assert.throws(() => readAikenFolder(dir), /symbolic link/);
+});
+
+test('escrow over x402 is off unless X402_ESCROW_ENABLED is true', async () => {
+  const core = await import('../src/x402/core.mjs');
+  const saved = process.env.X402_ESCROW_ENABLED;
+  try {
+    delete process.env.X402_ESCROW_ENABLED;
+    const options = core.quoteOptions('small', { native: 'addr_test1native', escrow: 'addr_test1escrow' });
+    assert.ok(options.length > 0 && options.every((o) => o.method === 'native'));
+    assert.throws(() => core.parseAuditRequest({ tier: 'see', method: 'escrow', code: 'validator v { spend(_d, _r, _o, _t) { True } }' }),
+      (e) => e.code === 'method_not_offered');
+  } finally {
+    if (saved === undefined) delete process.env.X402_ESCROW_ENABLED; else process.env.X402_ESCROW_ENABLED = saved;
+  }
 });
