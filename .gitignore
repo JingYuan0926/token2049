@@ -4,3 +4,4 @@ node_modules/
 work/
 logs/
 masumi-payment-service/
+.claude/settings.local.json
