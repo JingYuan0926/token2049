@@ -13,14 +13,15 @@ import { MASUMI_MAX_DEADLINE_HORIZON_MS, USDM_PREPROD_ASSET, decodeCardanoTransa
   verifyMasumiAuthorization } from '@x402/cardano';
 import { ExactCardanoScheme as ExactCardanoClient } from '@x402/cardano/exact/client';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
-import { BUYER_SPEND_CONTROLS, ESCROW_ADDRESS, MAX_SPEND_ATOMIC, NETWORK, SCAN_TX, USDM_ASSET, termsDigestOf, x402ResultHash } from '../x402/core.mjs';
+import { BUYER_SPEND_CONTROLS, ESCROW_ADDRESS, MAX_SPEND_ATOMIC, NETWORK, SCAN_TX, USDM_ASSET, quoteProblem, termsDigestOf,
+  x402ResultHash } from '../x402/core.mjs';
 import { createWalletFile, readWalletFile } from '../x402/wallet.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const WALLET = join(root, '.local/buyer-wallet.json');
 const JOBS = join(root, '.local/buyer-jobs');
 const BLOCKFROST = process.env.BLOCKFROST_PREPROD_URL || 'https://cardano-preprod.blockfrost.io/api/v0';
-// Non-secret Preprod test project id, used when BLOCKFROST_PROJECT_ID is not set.
+// The Blockfrost Preprod project id comes from .env (BLOCKFROST_PROJECT_ID).
 const BLOCKFROST_ID = process.env.BLOCKFROST_PROJECT_ID;
 const MIN_LOVELACE = 5_000_000n;
 
@@ -83,14 +84,17 @@ async function sendPaid(job, /** @type {string} */ journalPath) {
 
   if (res.status !== 200 || !data.report) {
     console.error(`No report. HTTP ${res.status}: ${data.error ?? ''} ${data.message ?? data.error ?? ''}`.trim());
-    if (settle?.errorReason === 'settlement_pending' || data.error === 'settlement_pending' || data.error === 'in_progress')
-      console.error(`Do not pay again. Later run: node src/cli/buy.mjs --resume ${journalPath}`);
+    // Any failure except a final one may hide a lock on chain. Resending the same signature never pays twice.
+    if (data.error !== 'payment_failed') console.error(`Do not pay again. Later run: node src/cli/buy.mjs --resume ${journalPath}`);
     if (data.refund) console.error(data.refund);
     process.exit(1);
   }
   const reportPath = journalPath.replace(/\.json$/, '.report.md');
   writeFileSync(reportPath, data.report, { mode: 0o600 });
-  const mine = x402ResultHash(data.buyerNonce ?? '', data.report);
+  // Hash with the buyer nonce we signed, not the one the server reports.
+  let signedNonce = '';
+  try { signedNonce = JSON.parse(Buffer.from(job.paymentSignature, 'base64').toString('utf8')).accepted.extra.terms.buyerNonce ?? ''; } catch { /* keep '' */ }
+  const mine = x402ResultHash(signedNonce, data.report);
   console.log(`Report: ${reportPath}`);
   console.log(`Escrow transaction: ${data.escrowTx?.url ?? 'unknown'}`);
   console.log(`Result hash: ${data.resultHash} (${mine === data.resultHash ? 'matches the report' : `MISMATCH, local ${mine}`})`);
@@ -116,6 +120,9 @@ async function buy() {
   if (!offer) fail('The server offered no Masumi payment on Cardano Preprod.');
   if (offer.payTo !== ESCROW_ADDRESS || offer.asset !== USDM_ASSET || BigInt(offer.amount) > BigInt(MAX_SPEND_ATOMIC))
     fail(`Refused: unexpected escrow, asset or price (${offer.payTo}, ${offer.asset}, ${offer.amount}).`);
+  // The price and deadline gaps must be the published ones for this tier, not just under the spend cap.
+  const problem = quoteProblem(offer, body.tier, /** @type {any} */ (offer.extra)?.terms?.sellerAddress);
+  if (problem) fail(`Refused: the quote does not fit the "${body.tier}" tier (${problem}).`);
 
   // 2. Check the seller-signed terms, the same way the signer does before it signs.
   const check = await verifyMasumiAuthorization(/** @type {any} */ (offer.extra), offer,
@@ -154,6 +161,7 @@ async function buy() {
   const job = { createdAt: new Date().toISOString(), server: opts.server, tier: body.tier, bodyText, paymentSignature, txHash,
     termsDigest: digest, blockchainIdentifier: /** @type {any} */ (offer.extra).blockchainIdentifier };
   writeFileSync(journalPath, `${JSON.stringify(job, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  console.log(`Signed payment saved: ${journalPath}. If this run stops, resend it with --resume. Do not pay again.`);
   await sendPaid(job, journalPath);
 }
 

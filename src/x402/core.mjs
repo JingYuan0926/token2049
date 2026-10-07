@@ -2,8 +2,9 @@
 // result hash, quote storage and the job journal. No network calls here.
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { buildSignedTerms, commitmentPartDigest, computeTermsDigest, masumiEscrowAddress } from '@x402/cardano';
+import { join, relative } from 'node:path';
+import { ERR_SETTLEMENT_DEFINITIVELY_REJECTED, ERR_SETTLEMENT_FAILED, buildSignedTerms, commitmentPartDigest, computeTermsDigest,
+  masumiEscrowAddress } from '@x402/cardano';
 import { MAX_CODE_BYTES, parseGithub } from '../engine/input.mjs';
 import { TIERS, USDM_PREPROD, getTier } from '../payment/tiers.mjs';
 
@@ -85,8 +86,12 @@ export function parseAuditRequest(body) {
     if (Buffer.byteLength(code) > MAX_CODE_BYTES) throw new HttpError(413, 'code_too_large', `code must be ${MAX_CODE_BYTES} bytes or fewer.`);
     source = { kind: 'code', code };
   } else {
-    const link = typeof github === 'string' && github.length <= 500 && github.trim().startsWith('https://github.com/') ? parseGithub(github.trim()) : null;
-    if (!link) throw new HttpError(400, 'invalid_github', 'github must be a public https://github.com link.');
+    const text = typeof github === 'string' ? github.trim() : '';
+    const link = text.length <= 500 && text.startsWith('https://github.com/') && !/\s/.test(text) ? parseGithub(text) : null;
+    // No "." or ".." path segments and no ref that git could read as an option.
+    const segments = link ? link.display.slice('https://github.com/'.length).split('/') : [];
+    if (!link || segments.some((s) => s === '.' || s === '..') || link.ref?.startsWith('-'))
+      throw new HttpError(400, 'invalid_github', 'github must be a public https://github.com link.');
     source = { kind: 'github', ...link };
   }
   return { tier, source, buyerNotes: typeof description === 'string' ? description : '' };
@@ -116,6 +121,53 @@ export function bodyMatchesQuote(requirements, body) {
 /** termsDigest of an issued Masumi quote. It is the job key. @param {any} requirements */
 export function termsDigestOf(requirements) {
   return computeTermsDigest(buildSignedTerms(requirements.extra, requirements));
+}
+
+/**
+ * Checks a quote against this tier: network, escrow, asset, price, seller, no registry claim, deadline gaps.
+ * Returns null when it matches, or the name of the first field that does not.
+ * @param {any} requirements @param {string} tier @param {string} sellerAddress
+ */
+export function quoteProblem(requirements, tier, sellerAddress) {
+  const offer = x402Offer(tier);
+  const terms = requirements?.extra?.terms;
+  if (requirements?.scheme !== 'exact' || requirements.network !== NETWORK) return 'network';
+  if (requirements.payTo !== ESCROW_ADDRESS) return 'payTo';
+  if (requirements.asset !== offer.asset || requirements.amount !== offer.amount) return 'price';
+  if (requirements.maxTimeoutSeconds !== offer.maxTimeoutSeconds) return 'maxTimeoutSeconds';
+  if (requirements.extra?.assetTransferMethod !== 'masumi' || !terms) return 'assetTransferMethod';
+  if (terms.sellerAddress !== sellerAddress) return 'seller';
+  if (terms.agentIdentifier != null && terms.agentIdentifier !== '') return 'agentIdentifier';
+  const payBy = Number(terms.payByTime);
+  const { deadlines } = offer;
+  if (Number(terms.submitResultTime) - payBy !== deadlines.submitResultAfterPayByMs
+    || Number(terms.unlockTime) - payBy !== deadlines.unlockAfterPayByMs
+    || Number(terms.externalDisputeUnlockTime) - payBy !== deadlines.externalDisputeUnlockAfterPayByMs) return 'deadlines';
+  return null;
+}
+
+/**
+ * True only when the transaction can never reach the chain. Any other failure (a timeout, a gateway
+ * error, a duplicate or unknown submission) may hide a broadcast, so the job stays resumable.
+ * @param {{errorReason?: string, extra?: any}} settle
+ */
+export function settleFailureIsFinal(settle) {
+  return settle.errorReason === ERR_SETTLEMENT_DEFINITIVELY_REJECTED
+    || (settle.errorReason === ERR_SETTLEMENT_FAILED && settle.extra?.status === 'expired');
+}
+
+/** First symbolic link inside a cloned repository (outside .git), or null. @param {string} dir */
+export function findSymlink(dir) {
+  const stack = [dir];
+  while (stack.length) {
+    const current = /** @type {string} */ (stack.pop());
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isSymbolicLink()) return relative(dir, path);
+      if (entry.isDirectory() && !(current === dir && entry.name === '.git')) stack.push(path);
+    }
+  }
+  return null;
 }
 
 /**

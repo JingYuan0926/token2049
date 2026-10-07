@@ -31,7 +31,9 @@ export function createWalletFile(path) {
  */
 export function readWalletFile(path) {
   if ((statSync(path).mode & 0o077) !== 0) throw new Error(`${path} must have mode 600. Run: chmod 600 ${path}`);
-  const record = JSON.parse(readFileSync(path, 'utf8'));
+  let record;
+  // A JSON.parse error quotes part of the text, which could be mnemonic words. Do not pass it on.
+  try { record = JSON.parse(readFileSync(path, 'utf8')); } catch { throw new Error(`${path} is not valid JSON.`); }
   if (record?.network !== NETWORK || typeof record.mnemonic !== 'string' || addressOf(record.mnemonic) !== record.address)
     throw new Error(`${path} is not a valid ${NETWORK} wallet file.`);
   return record;

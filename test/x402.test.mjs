@@ -1,15 +1,16 @@
 // x402 channel tests. No network: the facilitator, the audit engine and MPS are stubs.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { PrivateKey } from '@evolution-sdk/evolution';
 import { decodeCardanoTransaction, masumiEscrowAddress, toMasumiSellerSigner, verifyMasumiAuthorization } from '@x402/cardano';
 import { BUYER_SPEND_CONTROLS, ESCROW_ADDRESS, FileMasumiTermsStorage, HttpError, MAX_SPEND_ATOMIC, USDM_ASSET, bodyMatchesQuote, createJournal,
-  parseAuditRequest, termsDigestOf, x402Offer, x402ResultHash } from '../src/x402/core.mjs';
+  findSymlink, parseAuditRequest, quoteProblem, settleFailureIsFinal, termsDigestOf, x402Offer, x402ResultHash } from '../src/x402/core.mjs';
 import { createX402Server } from '../src/x402/server.mjs';
+import { readWalletFile } from '../src/x402/wallet.mjs';
 import { MpsError } from '../src/payment/mps.mjs';
 import { x402Client } from '@x402/core/client';
 import { USDM_PREPROD } from '../src/payment/tiers.mjs';
@@ -30,15 +31,19 @@ function fakeTx(seed = 'ab') {
 }
 
 /** Starts the server on a random port with stubs. */
-async function start({ now = Date.now, audit, mps, settle } = /** @type {any} */ ({})) {
-  const calls = { verify: 0, settle: 0, audit: 0, mps: 0, phases: /** @type {string[]} */ ([]) };
+async function start({ now = Date.now, audit, mps, settle, verify, prepareWorkspace } = /** @type {any} */ ({})) {
+  const calls = { verify: 0, settle: 0, audit: 0, mps: 0, phases: /** @type {string[]} */ ([]), auditArgs: /** @type {any[]} */ ([]) };
   const stateDir = mkdtempSync(join(tmpdir(), 'x402-test-'));
   /** @type {any} */
   let app;
   const phaseOf = (/** @type {any} */ req) => app.journal.load(termsDigestOf(req))?.phase;
   const facilitator = {
     getSupported: async () => SUPPORTED,
-    verify: async () => { calls.verify += 1; return { isValid: true, payer: 'addr_test1buyer' }; },
+    verify: async () => {
+      calls.verify += 1;
+      if (verify) await verify(calls.verify);
+      return { isValid: true, payer: 'addr_test1buyer' };
+    },
     settle: async (/** @type {any} */ payload, /** @type {any} */ req) => {
       calls.settle += 1;
       calls.phases.push(`settle:${phaseOf(req)}`);
@@ -48,8 +53,10 @@ async function start({ now = Date.now, audit, mps, settle } = /** @type {any} */
   };
   app = createX402Server({
     facilitator, seller, stateDir, publicUrl: 'http://127.0.0.1:3013', now, log: () => {}, keepAliveMs: 5,
+    ...(prepareWorkspace ? { prepareWorkspace } : {}),
     runAudit: async (/** @type {any} */ args) => {
       calls.audit += 1;
+      calls.auditArgs.push(args);
       if (audit) return audit(args);
       return { report: `# Report\n\ntier ${args.tier}\n\n## Cardano proof\n\n${args.proof}\n` };
     },
@@ -68,7 +75,7 @@ async function start({ now = Date.now, audit, mps, settle } = /** @type {any} */
   const base = `http://127.0.0.1:${app.server.address().port}`;
   const post = (/** @type {unknown} */ body, /** @type {Record<string, string>} */ headers = {}) =>
     fetch(`${base}/audit`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
-  return { app, base, post, calls, stop: () => new Promise((resolve) => app.server.close(resolve)) };
+  return { app, base, post, calls, stateDir, stop: () => new Promise((resolve) => app.server.close(resolve)) };
 }
 
 /** Gets a 402 and builds the PAYMENT-SIGNATURE header a buyer would send. */
@@ -139,6 +146,11 @@ test('parseAuditRequest accepts code or a GitHub link and rejects everything els
     [{ tier: 'see', code: '   ' }, 400, 'invalid_code'],
     [{ tier: 'see', code: 'x'.repeat(200_001) }, 413, 'code_too_large'],
     [{ tier: 'see', github: 'https://gitlab.com/a/b' }, 400, 'invalid_github'],
+    [{ tier: 'see', github: 'https://github.com/a/b/tree/main/../../..' }, 400, 'invalid_github'],
+    [{ tier: 'see', github: 'https://github.com/../../tree/main' }, 400, 'invalid_github'],
+    [{ tier: 'see', github: 'https://github.com/a/b/tree/--upload-pack/x' }, 400, 'invalid_github'],
+    [{ tier: 'see', github: 'https://github.com/a/b https://github.com/c/d' }, 400, 'invalid_github'],
+    [{ tier: 'see', github: 'https://github.com.evil.io/a/b' }, 400, 'invalid_github'],
     [{ tier: 'see', code: CODE, extra: 1 }, 400, 'unknown_field'],
     [{ tier: 'see', code: CODE, description: 5 }, 400, 'invalid_description'],
     [[], 400, 'invalid_body'],
@@ -366,6 +378,166 @@ test('after a restart, settled jobs resume and an unknown MPS outcome is never r
   assert.equal(journal.load(settled).resultHash, sha(';# resumed\n'));
   assert.equal(journal.load(unknown).phase, 'submit-pending');
   assert.equal(submits, 1);
+});
+
+// ---------- payment-safety regressions ----------
+
+test('a duplicate paid request that waits in verify never settles, audits or submits a second time', async () => {
+  /** @type {() => void} */
+  let secondEntered = () => {};
+  const bothIn = new Promise((resolve) => { secondEntered = () => resolve(undefined); });
+  /** @type {() => void} */
+  let release = () => {};
+  const hold = new Promise((resolve) => { release = () => resolve(undefined); });
+  // Verify 1 waits until request 2 is also in verify; verify 2 waits until request 1 has finished.
+  const srv = await start({ mps: async () => ({}), verify: async (/** @type {number} */ n) => {
+    if (n === 1) await bothIn;
+    else { secondEntered(); await hold; }
+  } });
+  try {
+    const body = { tier: 'see', code: CODE };
+    const { header } = await quoteAndPay(srv, body);
+    const requests = [srv.post(body, { 'PAYMENT-SIGNATURE': header }), srv.post(body, { 'PAYMENT-SIGNATURE': header })];
+    const [index, firstRes] = await Promise.race(requests.map((p, i) => p.then((r) => /** @type {const} */ ([i, r]))));
+    const first = await readJob(firstRes);
+    assert.equal(first.phase, 'result-submitted');
+    release();
+    const second = await readJob(await requests[1 - index]);
+    assert.equal(second.resultHash, first.resultHash);
+    assert.deepEqual([srv.calls.settle, srv.calls.audit, srv.calls.mps], [1, 1, 1]);
+  } finally { release(); await srv.stop(); }
+});
+
+test('the paid shortcut needs the committed body, so chain data alone cannot fetch a report', async () => {
+  const srv = await start();
+  try {
+    const body = { tier: 'see', code: CODE };
+    const { header } = await quoteAndPay(srv, body);
+    assert.equal((await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': header }))).ok, true);
+    // The terms digest and the transaction are public on chain. The body is not.
+    const other = await srv.post({ tier: 'see', code: 'validator x { else(_) { True } }' }, { 'PAYMENT-SIGNATURE': header });
+    assert.equal(other.status, 400);
+    const json = await other.json();
+    assert.equal(json.error, 'body_mismatch');
+    assert.equal(json.report, undefined);
+    assert.deepEqual([srv.calls.settle, srv.calls.audit], [1, 1]);
+  } finally { await srv.stop(); }
+});
+
+test('an unknown settlement outcome keeps the job resumable; only a final rejection ends it', async () => {
+  const outcomes = [
+    () => { throw new Error('socket hang up'); },
+    (/** @type {string} */ tx) => ({ success: false, errorReason: 'exact_cardano_settlement_failed', errorMessage: 'submit timed out', transaction: tx, network: 'cardano:preprod' }),
+    (/** @type {string} */ tx) => ({ success: false, errorReason: 'duplicate_settlement', transaction: tx, network: 'cardano:preprod' }),
+  ];
+  let step = 0;
+  const srv = await start({ settle: (/** @type {string} */ tx) => (step < outcomes.length ? outcomes[step++](tx)
+    : { success: true, transaction: tx, network: 'cardano:preprod' }) });
+  try {
+    const body = { tier: 'see', code: CODE };
+    const { accepted, header } = await quoteAndPay(srv, body);
+    for (let i = 0; i < outcomes.length; i += 1) {
+      const res = await srv.post(body, { 'PAYMENT-SIGNATURE': header });
+      assert.equal(res.status, 402);
+      const json = await res.json();
+      assert.equal(json.error, 'settlement_unknown');
+      assert.match(json.message, /Do not pay again/);
+      assert.equal(srv.app.journal.load(termsDigestOf(accepted)).phase, 'settle-pending');
+    }
+    assert.equal(srv.calls.audit, 0);
+    const done = await srv.post(body, { 'PAYMENT-SIGNATURE': header });
+    assert.equal(done.status, 200);
+    assert.equal((await readJob(done)).ok, true);
+    assert.equal(srv.calls.audit, 1);
+  } finally { await srv.stop(); }
+
+  const final = await start({ settle: (/** @type {string} */ tx) => ({ success: false, errorReason: 'exact_cardano_settlement_definitively_rejected', transaction: tx, network: 'cardano:preprod' }) });
+  try {
+    const body = { tier: 'see', code: CODE };
+    const { accepted, header } = await quoteAndPay(final, body);
+    assert.equal((await final.post(body, { 'PAYMENT-SIGNATURE': header })).status, 402);
+    assert.equal(final.app.journal.load(termsDigestOf(accepted)).phase, 'settle-failed');
+    const again = await final.post(body, { 'PAYMENT-SIGNATURE': header });
+    assert.equal((await again.json()).error, 'payment_failed');
+    assert.deepEqual([final.calls.settle, final.calls.audit], [1, 0]);
+  } finally { await final.stop(); }
+  assert.equal(settleFailureIsFinal({ errorReason: 'exact_cardano_settlement_failed', extra: { status: 'expired' } }), true);
+  assert.equal(settleFailureIsFinal({ errorReason: 'settlement_pending' }), false);
+});
+
+test('requests with a payment header for an unknown quote count against the quote limit', async () => {
+  const srv = await start();
+  try {
+    const body = { tier: 'see', code: CODE };
+    const { accepted } = await quoteAndPay(srv, body);
+    // A decodable payment for a quote this server never issued.
+    const forged = { ...accepted, extra: { ...accepted.extra, terms: { ...accepted.extra.terms, sellerNonce: 'f'.repeat(64) } } };
+    const tx = fakeTx('cd');
+    const forgedHeader = Buffer.from(JSON.stringify({ x402Version: 2, resource: { url: 'http://x/audit' }, accepted: forged,
+      payload: { transaction: tx.transaction, nonce: tx.nonce } })).toString('base64');
+    const statuses = [];
+    for (let i = 0; i < 31; i += 1) statuses.push((await srv.post(body, { 'PAYMENT-SIGNATURE': forgedHeader })).status);
+    assert.equal(statuses.at(-1), 429);
+    assert.ok(statuses.slice(0, 29).every((s) => s === 402));
+    assert.ok(readdirSync(join(srv.stateDir, 'terms')).length <= 2 * 30, 'stored quotes stay bounded');
+    assert.equal(srv.calls.settle, 0);
+  } finally { await srv.stop(); }
+});
+
+test('a GitHub clone with a symbolic link is refused before the audit reads any file', async () => {
+  const outside = mkdtempSync(join(tmpdir(), 'x402-secret-'));
+  writeFileSync(join(outside, 'wallet.json'), '{"mnemonic":"not a real one"}');
+  const clone = (/** @type {boolean} */ withLink) => {
+    const dir = mkdtempSync(join(tmpdir(), 'x402-clone-'));
+    mkdirSync(join(dir, 'validators'));
+    writeFileSync(join(dir, 'aiken.toml'), 'name = "a/b"\n');
+    writeFileSync(join(dir, 'validators/a.ak'), CODE);
+    if (withLink) symlinkSync(join(outside, 'wallet.json'), join(dir, 'validators/b.ak'));
+    return { dir, root: dir, label: 'test clone' };
+  };
+  assert.equal(findSymlink(clone(false).dir), null);
+  assert.equal(findSymlink(clone(true).dir), join('validators', 'b.ak'));
+
+  let withLink = true;
+  const srv = await start({ prepareWorkspace: async () => clone(withLink) });
+  try {
+    const body = { tier: 'see', github: 'https://github.com/a/b' };
+    const { header } = await quoteAndPay(srv, body);
+    const job = await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': header }));
+    assert.equal(job.ok, false);
+    assert.equal(job.phase, 'failed');
+    assert.match(job.error, /symbolic link/);
+    assert.equal(srv.calls.audit, 0);
+    assert.equal(srv.calls.mps, 0);
+    withLink = false;
+    const clean = await quoteAndPay(srv, body, 'ef');
+    assert.equal((await readJob(await srv.post(body, { 'PAYMENT-SIGNATURE': clean.header }))).ok, true);
+    assert.equal(srv.calls.auditArgs[0].workspace.label, 'test clone');
+  } finally { await srv.stop(); }
+});
+
+test('quoteProblem accepts only this tier\'s price, escrow, seller, deadlines and no registry claim', async () => {
+  const srv = await start();
+  try {
+    const { accepted: see } = await quoteAndPay(srv, { tier: 'see', code: CODE });
+    const { accepted: write } = await quoteAndPay(srv, { tier: 'write', code: CODE });
+    assert.equal(quoteProblem(see, 'see', seller.sellerAddress), null);
+    assert.equal(quoteProblem(write, 'write', seller.sellerAddress), null);
+    assert.equal(quoteProblem(see, 'write', seller.sellerAddress), 'price');
+    assert.equal(quoteProblem({ ...write, amount: see.amount }, 'see', seller.sellerAddress), 'deadlines');
+    assert.equal(quoteProblem({ ...see, payTo: 'addr_test1other' }, 'see', seller.sellerAddress), 'payTo');
+    assert.equal(quoteProblem({ ...see, asset: `${'1'.repeat(56)}.00` }, 'see', seller.sellerAddress), 'price');
+    assert.equal(quoteProblem({ ...see, network: 'cardano:mainnet' }, 'see', seller.sellerAddress), 'network');
+    assert.equal(quoteProblem(see, 'see', 'addr_test1someoneelse'), 'seller');
+    const claim = { ...see, extra: { ...see.extra, terms: { ...see.extra.terms, agentIdentifier: 'ab'.repeat(30) } } };
+    assert.equal(quoteProblem(claim, 'see', seller.sellerAddress), 'agentIdentifier');
+  } finally { await srv.stop(); }
+});
+
+test('a broken wallet file error never quotes the file text', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'x402-wallet-')), 'w.json');
+  writeFileSync(path, 'abandon ability able about above absent', { mode: 0o600 });
+  assert.throws(() => readWalletFile(path), (error) => error instanceof Error && !/abandon|ability/.test(error.message));
 });
 
 test('file quote storage updates atomically and prunes only unpaid, expired quotes', async () => {

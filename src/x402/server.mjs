@@ -12,11 +12,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { decodeCardanoTransaction, toMasumiSellerSigner } from '@x402/cardano';
 import { ExactCardanoScheme } from '@x402/cardano/exact/server';
 import { FacilitatorResponseError, HTTPFacilitatorClient, x402HTTPResourceServer, x402ResourceServer } from '@x402/core/server';
+import { prepareWorkspace as enginePrepareWorkspace } from '../engine/aiken.mjs';
 import { runAudit as engineRunAudit } from '../engine/index.mjs';
 import { createMpsClient } from '../payment/mps.mjs';
 import { ESCROW_ADDRESS, FileMasumiTermsStorage, HttpError, NETWORK, RESULT_HASH_RULE, RUN_BUDGET_MS, SCAN_TX, SETTLE_ALLOWANCE_MS,
-  USDM_ASSET, X402_TIERS, bodyMatchesQuote, commitmentFor, createJournal, parseAuditRequest, termsDigestOf, x402Offer,
-  x402ResultHash } from './core.mjs';
+  USDM_ASSET, X402_TIERS, bodyMatchesQuote, commitmentFor, createJournal, findSymlink, parseAuditRequest, quoteProblem,
+  settleFailureIsFinal, termsDigestOf, x402Offer, x402ResultHash } from './core.mjs';
 import { createWalletFile, readWalletFile } from './wallet.mjs';
 
 export const HOSTED_FACILITATOR = 'https://x402.preprod.dev.ecosyseng.cf-deployments.org';
@@ -124,11 +125,12 @@ function proofSection(job) {
  *   mps?: {submitResult: (blockchainIdentifier: string, hash: string) => Promise<unknown>} | null,
  *   stateDir: string, publicUrl: string, runAudit?: typeof engineRunAudit, now?: () => number,
  *   log?: (line: string) => void, keepAliveMs?: number, quoteLimit?: {max: number, windowMs: number},
+ *   prepareWorkspace?: typeof enginePrepareWorkspace,
  * }} options
  */
 export function createX402Server({ facilitator, seller, mps = null, stateDir, publicUrl, runAudit = engineRunAudit,
   now = Date.now, log = (line) => console.log(`${new Date().toISOString()} ${line}`), keepAliveMs = 15_000,
-  quoteLimit = { max: 30, windowMs: 10 * 60_000 } }) {
+  quoteLimit = { max: 30, windowMs: 10 * 60_000 }, prepareWorkspace = enginePrepareWorkspace }) {
   const journal = createJournal(join(stateDir, 'jobs'));
   const storage = new FileMasumiTermsStorage(join(stateDir, 'terms'));
   const resourceUrl = new URL('/audit', publicUrl).href;
@@ -226,7 +228,14 @@ export function createX402Server({ facilitator, seller, mps = null, stateDir, pu
         }
         job = journal.save(digest, { ...job, phase: 'auditing', auditStartedAt: new Date(now()).toISOString() });
         log(`${short(digest)} audit started (${job.tier})`);
-        const result = await runAudit({ tier: job.tier, source: job.source, jobId: `x402-${digest.slice(0, 16)}`,
+        const jobId = `x402-${digest.slice(0, 16)}`;
+        // A cloned symlink could point at .local or .env, and the audit would read and quote that file.
+        let workspace;
+        if (job.source.kind === 'github') {
+          workspace = await prepareWorkspace(job.source, jobId);
+          if (findSymlink(workspace.dir)) throw new Error('The repository contains a symbolic link. Links are not followed, so no audit ran.');
+        }
+        const result = await runAudit({ tier: job.tier, source: job.source, jobId, workspace,
           buyerNotes: job.buyerNotes, proof: proofSection(job), log: (line) => log(`${short(digest)} ${line}`) });
         const resultHash = x402ResultHash(job.buyerNonce, result.report);
         writeFileSync(journal.reportPath(digest), result.report, { mode: 0o600 });
@@ -259,11 +268,16 @@ export function createX402Server({ facilitator, seller, mps = null, stateDir, pu
     const terms = requirements.extra.terms;
     if (!bodyMatchesQuote(requirements, body))
       return json(res, 400, { error: 'body_mismatch', message: 'This body differs from the one the quote committed to. Nothing was charged.' });
+    // Our own check of price, escrow, seller and deadlines, so we do not rely only on the library's quote matching.
+    const problem = quoteProblem(requirements, input.tier, /** @type {any} */ (seller).sellerAddress);
+    if (problem) return json(res, 400, { error: 'quote_mismatch', message: `This quote does not fit the ${input.tier} tier (${problem}). Nothing was charged.` });
     const digest = termsDigestOf(requirements);
     const txHash = decodeCardanoTransaction(paymentPayload.payload.transaction).txHash;
     if (active.has(digest)) return json(res, 409, { error: 'in_progress', message: 'This payment is already being processed.' });
     const previous = journal.load(digest);
     if (previous && previous.txHash !== txHash) return json(res, 409, { error: 'terms_already_paid', message: 'These terms are bound to another transaction.' });
+    // Another request settled this payment while ours waited for verify: answer from the journal, never settle again.
+    if (previous && previous.phase !== 'settle-pending') return replay(res, previous);
     // Take the money only when the result deadline leaves room for the work.
     // A resumed settlement skips this gate: its transaction may already be on chain.
     if (!previous && Number(terms.submitResultTime) - now() < RUN_BUDGET_MS[input.tier])
@@ -282,12 +296,19 @@ export function createX402Server({ facilitator, seller, mps = null, stateDir, pu
       log(`${short(digest)} payment verified, settling ${txHash.slice(0, 16)}…`);
       const settle = await gate.processSettlement(paymentPayload, requirements, verified.declaredExtensions, { request: context });
       if (!settle.success) {
-        const pending = settle.errorReason === 'settlement_pending';
-        journal.save(digest, { ...job, phase: pending ? 'settle-pending' : 'settle-failed', settleError: settle.errorReason });
-        log(`${short(digest)} settlement ${pending ? 'still pending' : `failed: ${settle.errorReason}`}`);
-        return sendInstructions(res, { ...settle.response, body: { error: settle.errorReason,
-          message: pending ? 'The payment is broadcast but not confirmed yet. Send the same PAYMENT-SIGNATURE again. Do not pay again.'
-            : 'Settlement failed. Request a new quote.' } });
+        const reason = String(settle.errorReason ?? 'unknown').slice(0, 200);
+        if (settleFailureIsFinal(settle)) {
+          journal.save(digest, { ...job, phase: 'settle-failed', settleError: reason });
+          log(`${short(digest)} settlement failed: ${reason}`);
+          return sendInstructions(res, { ...settle.response, body: { error: settle.errorReason,
+            message: 'This transaction can never reach the chain. Request a new quote.' } });
+        }
+        // Not final: the transaction may be on chain. Keep the job resumable with the same signature.
+        journal.save(digest, { ...job, phase: 'settle-pending', settleError: reason });
+        log(`${short(digest)} settlement not confirmed: ${reason}`);
+        return sendInstructions(res, { ...settle.response, body: {
+          error: reason === 'settlement_pending' ? 'settlement_pending' : 'settlement_unknown', reason,
+          message: 'The payment may already be on chain. Send the same PAYMENT-SIGNATURE again. Do not pay again.' } });
       }
       if (settle.transaction !== txHash) {
         journal.save(digest, { ...job, phase: 'settle-mismatch', flagged: true, settleTransaction: settle.transaction });
@@ -319,13 +340,18 @@ export function createX402Server({ facilitator, seller, mps = null, stateDir, pu
     if (!gate) throw new HttpError(503, 'not_ready', 'The x402 server is still starting.');
     const header = req.headers['payment-signature'];
     const paymentHeader = Array.isArray(header) ? header[0] : header;
-    if (paymentHeader) {
-      const key = paidJobKey(paymentHeader);
-      if (key && active.has(key.digest)) return json(res, 409, { error: 'in_progress', message: 'This payment is already being processed.' });
-      const job = key && journal.load(key.digest);
-      if (job && job.txHash === key.txHash && job.phase !== 'settle-pending') return replay(res, job);
-    } else if (!allowQuote(req.socket.remoteAddress ?? 'unknown')) {
+    const key = paymentHeader ? paidJobKey(paymentHeader) : null;
+    const stored = key ? await storage.get(key.digest) : undefined;
+    // Known: a retry for a quote we issued, with the body it committed to. The digest and the
+    // transaction can be rebuilt from public chain data; the body cannot.
+    const known = Boolean(key && stored && bodyMatchesQuote(stored.requirements, body));
+    // Anything else can make the core issue and store a new signed quote, so it counts against the limit.
+    if (!known && !allowQuote(req.socket.remoteAddress ?? 'unknown'))
       throw new HttpError(429, 'too_many_quotes', 'Too many unpaid quotes. Try again later.');
+    if (known && key) {
+      if (active.has(key.digest)) return json(res, 409, { error: 'in_progress', message: 'This payment is already being processed.' });
+      const job = journal.load(key.digest);
+      if (job && job.txHash === key.txHash && job.phase !== 'settle-pending') return replay(res, job);
     }
     const context = { adapter: adapterFor(req, url, body), path: url.pathname, method: 'POST', paymentHeader };
     const verified = await gate.processHTTPRequest(context);
@@ -377,6 +403,8 @@ export function createX402Server({ facilitator, seller, mps = null, stateDir, pu
         gates.set(tier, gate);
       }
       storage.prune(now());
+      // Unpaid quotes are files on disk. Remove expired ones every hour, not only at start.
+      setInterval(() => { try { storage.prune(now()); } catch { /* retry next hour */ } }, 60 * 60_000).unref();
     },
     /** After a restart: finish settled jobs, flag jobs that stopped in an unknown state. */
     recover() {
