@@ -29,30 +29,38 @@ export function parseGithub(text) {
   };
 }
 
-export function extractCode(text) {
+export function extractFencedCode(text) {
   const fenced = [...text.matchAll(FENCE_RE)].map((m) => m[1].trim()).filter(Boolean);
-  if (fenced.length) return fenced.join('\n\n');
-  if (/\bvalidator\b/.test(text)) {
-    return text
-      .split('\n')
-      .filter((line) => !/^\s*(tier\s*[:=]?\s*)?\[?(see|write|audit)\]?\s*$/i.test(line))
-      .join('\n')
-      .trim();
-  }
-  return null;
+  return fenced.length ? fenced.join('\n\n') : null;
 }
 
+// Unfenced text counts as code only when it has an Aiken validator declaration,
+// so a sentence like "please check my validator" is not mistaken for code.
+export function extractRawCode(text) {
+  if (!/^\s*validator\s+\w+[\s\S]*\{/m.test(text)) return null;
+  return text
+    .split('\n')
+    .filter((line) => !/^\s*(tier\s*[:=]?\s*)?\[?(see|write|audit)\]?\s*$/i.test(line))
+    .join('\n')
+    .trim();
+}
+
+function codeSource(code) {
+  if (Buffer.byteLength(code) > MAX_CODE_BYTES) {
+    throw new Error(`The pasted code is larger than ${MAX_CODE_BYTES / 1000} KB.`);
+  }
+  return { kind: 'code', code };
+}
+
+// Order: a fenced code block, then a GitHub link, then unfenced validator code.
 export function parseTaskInput(text) {
   const source = String(text ?? '');
   const tier = parseTier(source);
-  const code = extractCode(source);
-  if (code) {
-    if (Buffer.byteLength(code) > MAX_CODE_BYTES) {
-      throw new Error(`The pasted code is larger than ${MAX_CODE_BYTES / 1000} KB.`);
-    }
-    return { tier, source: { kind: 'code', code } };
-  }
+  const fenced = extractFencedCode(source);
+  if (fenced) return { tier, source: codeSource(fenced) };
   const github = parseGithub(source);
   if (github) return { tier, source: { kind: 'github', ...github } };
-  throw new Error('No Aiken code or public GitHub link found. Paste the validator code in a ``` block, or add a https://github.com link.');
+  const raw = extractRawCode(source);
+  if (raw) return { tier, source: codeSource(raw) };
+  throw new Error('No Aiken code or public GitHub link found. Paste the validator code in a ``` block, or add a https://github.com link to the repository.');
 }

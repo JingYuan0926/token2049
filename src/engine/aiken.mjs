@@ -10,8 +10,8 @@ const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 export const WORK_DIR = resolve(here, '../../work');
 const TEMPLATE_DIR = join(WORK_DIR, '_template');
-const MAX_SOURCE_BYTES = 150_000;
-const MAX_REPO_BYTES = 20_000_000;
+const MAX_SOURCE_BYTES = 400_000;
+const MAX_REPO_BYTES = 100_000_000;
 
 // Builds run with a clean environment: no API keys or other secrets.
 const AIKEN_ENV = {
@@ -103,12 +103,38 @@ export async function prepareWorkspace(source, jobId) {
   if (source.ref) args.push('--branch', source.ref);
   args.push(source.url, dir);
   await run('git', args, { timeout: 90_000, env: { ...AIKEN_ENV, GIT_TERMINAL_PROMPT: '0' } });
-  if (dirBytes(dir) > MAX_REPO_BYTES) throw new Error('The repository is larger than 20 MB.');
-  const root = source.subdir ? resolve(dir, source.subdir) : dir;
-  if (!root.startsWith(dir) || !existsSync(join(root, 'aiken.toml'))) {
-    throw new Error('No aiken.toml found at the linked path. Link to the folder of an Aiken project.');
+  if (dirBytes(dir) > MAX_REPO_BYTES) throw new Error('The repository is larger than 100 MB.');
+  const base = source.subdir ? resolve(dir, source.subdir) : dir;
+  if (base !== dir && !base.startsWith(`${dir}/`)) throw new Error('The linked path is outside the repository.');
+  const projects = findAikenProjects(base);
+  if (!projects.length) {
+    throw new Error('No Aiken project (aiken.toml with a validators folder) found in this repository.');
   }
-  return { dir, root, label: source.display };
+  const [chosen, ...others] = projects;
+  const where = relative(dir, chosen.root) || '.';
+  const note = others.length ? ` (also found: ${others.map((p) => relative(dir, p.root)).join(', ')})` : '';
+  return { dir, root: chosen.root, label: `${source.display} → ${where}${note}` };
+}
+
+// Searches a cloned repository for Aiken projects. The shallowest project with the
+// most validator files comes first.
+function findAikenProjects(base) {
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > 6) return;
+    const entries = readdirSync(dir, { withFileTypes: true });
+    if (entries.some((e) => e.isFile() && e.name === 'aiken.toml') && existsSync(join(dir, 'validators'))) {
+      const validators = readdirSync(join(dir, 'validators'), { recursive: true }).filter((f) => String(f).endsWith('.ak')).length;
+      if (validators) found.push({ root: dir, depth, validators });
+    }
+    for (const e of entries) {
+      if (e.isDirectory() && !['node_modules', 'build', '.git', 'dist', 'target'].includes(e.name) && !e.name.startsWith('.')) {
+        walk(join(dir, e.name), depth + 1);
+      }
+    }
+  };
+  walk(base, 0);
+  return found.sort((a, b) => a.depth - b.depth || b.validators - a.validators);
 }
 
 export function collectSources(root) {
@@ -122,7 +148,7 @@ export function collectSources(root) {
       else if (entry.name.endsWith('.ak')) {
         const content = readFileSync(path, 'utf8');
         total += Buffer.byteLength(content);
-        if (total > MAX_SOURCE_BYTES) throw new Error('The Aiken sources are larger than 150 KB.');
+        if (total > MAX_SOURCE_BYTES) throw new Error('The Aiken sources are larger than 400 KB.');
         files.push({ path: relative(root, path), content });
       }
     }
