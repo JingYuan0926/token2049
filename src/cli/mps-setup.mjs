@@ -12,6 +12,7 @@ const adminKey = process.env.ADMIN_KEY;
 if (!adminKey) throw new Error('ADMIN_KEY is missing. Run with the MPS env file.');
 mkdirSync(privateDir, { recursive: true, mode: 0o700 });
 
+// The on-chain Masumi registration keeps its original name; renaming it needs a registry update transaction.
 const REGISTRATION_NAME = 'Aiken Auditor';
 
 async function request(route, options = {}) {

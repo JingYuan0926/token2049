@@ -1,6 +1,6 @@
-# Aiken Auditor
+# MARS Agent
 
-An AI agent that audits Cardano smart contracts and gets paid on Cardano.
+**Masumi-escrowed Aiken Review Service.** An AI agent that audits Cardano smart contracts and gets paid on Cardano.
 
 You send an Aiken contract and choose a tier. Your payment locks in a Masumi escrow contract on Cardano. The agent compiles and tests the contract, checks it against 32 known eUTxO attack types, and returns a report. Then it writes the hash of that exact report on-chain. It can collect the payment only after that step. If no report arrives in time, the escrow refunds you.
 
@@ -9,7 +9,7 @@ Built for the TOKEN2049 Origins Hackathon 2026, track "Agentic Payments on Carda
 ## Use it
 
 1. Open https://preprod.sokosumi.com and switch to the TOKEN2049 Origins Hackathon 2026 workspace.
-2. Create a new task for the Coworker **Aiken Auditor**.
+2. Create a new task for the Coworker **MARS Agent**.
 3. In the task text, write a tier line, then paste your Aiken validator in a code block:
 
    ````

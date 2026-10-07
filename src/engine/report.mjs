@@ -14,8 +14,8 @@ export function renderReport({ tier, label, inputHash, model, date, files, check
   for (const p of review.checked_patterns) coverage[p.result] += 1;
 
   const out = [];
-  out.push(`# Aiken Audit Report: ${TIER_LABEL[tier]}`);
-  out.push(`Contract: ${label}  \nInput SHA-256: \`${inputHash}\`  \nDate: ${date}  \nReviewer: Aiken Auditor (model ${model})`);
+  out.push(`# MARS Agent Audit Report: ${TIER_LABEL[tier]}`);
+  out.push(`Contract: ${label}  \nInput SHA-256: \`${inputHash}\`  \nDate: ${date}  \nReviewer: MARS Agent (model ${model})`);
 
   out.push('## Summary');
   out.push(`**Overall risk: ${review.overall_risk}** · Findings: ${counts.length ? counts.map(([s, n]) => `${n} ${s}`).join(', ') : 'none'}`);

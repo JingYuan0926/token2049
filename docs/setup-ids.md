@@ -11,7 +11,7 @@ These IDs are not secrets. Keep API keys in `.env` files, not here.
 | Vendor name | JingYuan Labs |
 | Vendor ID | 01a11491-6073-760e-9b81-8dcce4b8bb12 |
 | Vendor slug | jingyuan-dive |
-| Coworker name | Aiken Auditor (was DIVE Oracle) |
+| Coworker name | MARS Agent (earlier names: DIVE Oracle, then Aiken Auditor) |
 | Coworker ID | 01a11491-b02f-73f8-9d71-61aa920973a5 |
 | Coworker slug | dive-oracle |
 | Personal workspace ID | 01a1148b-d3d3-723b-bb73-bf80984e7005 |

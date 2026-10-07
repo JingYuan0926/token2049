@@ -1,4 +1,4 @@
-// Aiken Auditor worker. For each Sokosumi Task it: takes payment through Masumi escrow,
+// MARS Agent worker. For each Sokosumi Task it: takes payment through Masumi escrow,
 // runs the audit, submits the report hash on-chain, and completes the Task.
 // Every external write is journaled first, so a restart never repeats a payment step.
 import { execFileSync } from 'node:child_process';
@@ -60,7 +60,7 @@ function proofSection(state) {
   return [
     `- **Payment:** ${amount} test USDM, locked in the Masumi escrow contract on Cardano Preprod.`,
     `- **Escrow transaction:** [${p.escrowTxHash.slice(0, 16)}…](${SCAN}${p.escrowTxHash})`,
-    `- **Seller agent:** Aiken Auditor, registered on-chain in [${registration.registrationTxHash.slice(0, 16)}…](${SCAN}${registration.registrationTxHash})`,
+    `- **Seller agent:** MARS Agent, registered on-chain in [${registration.registrationTxHash.slice(0, 16)}…](${SCAN}${registration.registrationTxHash})`,
     `- **Purchase nonce:** \`${p.nonce}\` · **Task input hash:** \`${p.inputHash}\``,
     '- **Report hash:** the seller submits the hash of this exact report to the escrow. Only then can it collect the payment, so the report cannot change after delivery.',
     `- **Check it yourself:** save this report as \`report.md\`, then run \`node -e 'const t=require("fs").readFileSync("report.md","utf8");console.log(require("crypto").createHash("sha256").update("${p.nonce};"+JSON.stringify(t).slice(1,-1)).digest("hex"))'\` and compare it with the result hash in your Sokosumi task receipt.`,
@@ -96,7 +96,7 @@ async function startTask(task) {
     parsed = parseTaskInput(`${info.name}\n${info.description ?? ''}`);
   } catch (error) {
     save(id, { phase: 'started', task: info });
-    complete(id, load(id), `# Aiken Auditor: no audit started\n\n${error.message}\n\nNo payment was taken. Create a new task with the contract and a tier line, for example \`tier: see\`.\n`);
+    complete(id, load(id), `# MARS Agent: no audit started\n\n${error.message}\n\nNo payment was taken. Create a new task with the contract and a tier line, for example \`tier: see\`.\n`);
     return;
   }
   let inspection;
@@ -105,7 +105,7 @@ async function startTask(task) {
     inspection = { workspace, price: priceJob({ tier: parsed.tier, files }) };
   } catch (error) {
     save(id, { phase: 'started', task: info });
-    complete(id, load(id), `# Aiken Auditor: no audit started\n\n${error.message}\n\nNo payment was taken.\n`);
+    complete(id, load(id), `# MARS Agent: no audit started\n\n${error.message}\n\nNo payment was taken.\n`);
     return;
   }
   save(id, { phase: 'started', task: info, tier: parsed.tier, source: parsed.source, ...inspection });
@@ -119,7 +119,7 @@ async function requestPayment(id, state) {
   const noCharge = (error) => {
     if (error.uncertain) throw error;
     log(id, `payment not set up: ${error.message}`);
-    complete(id, load(id), `# Aiken Auditor: payment could not be set up\n\n${error.message}\n\nNo payment was taken. Please try again later.\n`);
+    complete(id, load(id), `# MARS Agent: payment could not be set up\n\n${error.message}\n\nNo payment was taken. Please try again later.\n`);
   };
   let quote;
   try {
@@ -144,7 +144,7 @@ async function checkEscrow(id, state) {
     log(id, `escrow locked ${tx.txHash}`);
     notify(id, `✅ Payment locked in Masumi escrow on Cardano: ${SCAN}${tx.txHash} — starting the audit.`);
   } else if (Date.now() > Number(state.quote.payByTime)) {
-    complete(id, state, '# Aiken Auditor: payment did not arrive\n\nThe escrow was not funded before the payment deadline, so no audit ran and nothing was charged. Please create a new task.\n');
+    complete(id, state, '# MARS Agent: payment did not arrive\n\nThe escrow was not funded before the payment deadline, so no audit ran and nothing was charged. Please create a new task.\n');
   }
 }
 
@@ -220,7 +220,7 @@ async function advance(id) {
           const refund = state.quote
             ? 'No report hash was submitted, so the escrow refunds your payment automatically after the result deadline.'
             : 'No payment was taken.';
-          complete(id, load(id), `# Aiken Auditor: the audit could not finish\n\n${error.message}\n\n${refund}\n`);
+          complete(id, load(id), `# MARS Agent: the audit could not finish\n\n${error.message}\n\n${refund}\n`);
         })
         .finally(() => running.delete(id));
     },
@@ -235,7 +235,7 @@ async function advance(id) {
   }
 }
 
-console.log(`Aiken Auditor worker: coworker ${COWORKER_ID}, paid tasks ${PAID ? 'ON' : 'OFF'}, model ${MODEL}`);
+console.log(`MARS Agent worker: coworker ${COWORKER_ID}, paid tasks ${PAID ? 'ON' : 'OFF'}, model ${MODEL}`);
 while (true) {
   try {
     const { tasks } = await fetchTasks(coworkerHttp, { coworkerId: COWORKER_ID, status: ['READY'] });
