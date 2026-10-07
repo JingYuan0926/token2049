@@ -1,0 +1,10 @@
+{
+  "name": "vesting-missing-signer",
+  "description": "Time-locked vesting contract. The owner locks ADA for a beneficiary until lock_until; after that time the beneficiary claims the funds, and before it the owner can cancel and take the funds back.",
+  "vulnerable": true,
+  "expectedPatterns": [
+    { "id": 4, "name": "Missing Signer Checks" }
+  ],
+  "minSeverity": "Critical",
+  "notes": "The Claim branch of spend only calls is_unlocked (validity range lower bound >= lock_until). It never checks list.has(self.extra_signatories, schedule.beneficiary), and it does not check that any output pays the beneficiary. The beneficiary field in the datum is never read. After the deadline, anyone can spend every vesting UTxO with redeemer Claim and send the funds to any address. The Cancel branch correctly checks the owner signature, so the flaw is only in Claim. Fix: require the beneficiary signature (or an output to the beneficiary) in Claim. Verified with a scratch test: Claim with extra_signatories = [] and validity_range = interval.after(200), lock_until = 100, returns True."
+}

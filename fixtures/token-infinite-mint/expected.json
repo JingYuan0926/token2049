@@ -1,0 +1,10 @@
+{
+  "name": "token-infinite-mint",
+  "description": "Minting policy for DAO membership tokens. The admin co-signs each issuance transaction, which mints exactly one token named after the new member; members can burn their token to leave.",
+  "vulnerable": true,
+  "expectedPatterns": [
+    { "id": 10, "name": "Infinite Minting" }
+  ],
+  "minSeverity": "High",
+  "notes": "The Issue branch checks the admin signature and assets.quantity_of(self.mint, policy_id, member) == 1, but only for the single asset name given in the redeemer. It does not check the other asset names minted under the same policy. Any transaction the admin signs (for example an applicant-built issuance transaction that the admin co-signs) can also mint unlimited quantities of other asset names, or more copies under other member names. Fix: destructure the whole per-policy mint, e.g. expect [Pair(name, qty)] = self.mint |> assets.tokens(policy_id) |> dict.to_pairs(), and require name == member and qty == 1. The Leave branch is sound: it only allows negative quantities (burns). Verified with a scratch test: Issue { member: \"alice\" } with mint alice=1 and bob=1_000_000, admin signed, returns True."
+}

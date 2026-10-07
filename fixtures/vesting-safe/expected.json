@@ -1,0 +1,8 @@
+{
+  "name": "vesting-safe",
+  "description": "Time-locked vesting. The owner locks funds for a beneficiary until a POSIX time (lock_until); after that time the beneficiary can claim with their signature, and the owner can cancel and take the funds back at any time with their signature.",
+  "vulnerable": false,
+  "expectedPatterns": [],
+  "minSeverity": null,
+  "notes": "Control fixture with no real vulnerability. Every branch checks a signer from the datum with list.has(self.extra_signatories, ...): Claim needs the beneficiary, Cancel needs the owner. Claim also uses interval.is_entirely_after(self.validity_range, lock_until), which reads the LOWER bound, returns False for a NegativeInfinity (unset) lower bound, and needs the whole range to start strictly after lock_until, so a wide or unbounded range cannot fake the time (#15/#16 handled). The else handler fails, so no other script purpose can use the script (#29 handled). No outputs are checked because the required signer chooses where the funds go, so double satisfaction (#1) and datum hijacking (#2) do not apply. Verified in scratch unit tests: claim at after(1001) passes; after(1000), after(999), everything, between(0, 5000), a missing beneficiary signature, and Cancel without the owner signature all fail. Acceptable Info-level remarks, not defects: the datum is not authenticated (a forged UTxO only affects its own creator), a UTxO sent without a datum stays locked, the owner can cancel at any time by design, and a claim at exactly lock_until with an inclusive lower bound is rejected (strictly after). Any finding at Low or above is a false positive."
+}

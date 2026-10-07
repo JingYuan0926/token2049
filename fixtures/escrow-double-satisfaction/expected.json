@@ -1,0 +1,10 @@
+{
+  "name": "escrow-double-satisfaction",
+  "description": "Fixed-price escrow sale. A seller locks an item at the script with a datum that names the seller's key hash and a price in lovelace; anyone can buy it by paying the seller at least the price, and the seller can cancel with their signature.",
+  "vulnerable": true,
+  "expectedPatterns": [
+    { "id": 1, "name": "Double Satisfaction" }
+  ],
+  "minSeverity": "High",
+  "notes": "The flaw is in the Buy branch of escrow.spend. It accepts the transaction if ANY output pays the seller's address at least listing.price (list.any over self.outputs). The output is not bound to the input being spent: own_ref is ignored (_own_ref), no output datum carries the spent OutputReference, and nothing limits the transaction to one script input. Each script input runs the same check against the same outputs, so one payment output satisfies every listing from the same seller whose price is at or below that payment. Attack: spend two listings by seller S at 100 ADA each and pay S one 100 ADA output; the attacker gets both items for the price of one. Verified in a scratch unit test: one 100 ADA output makes spend return True for two different OutputReferences. Fix: tag the payment output with the spent OutputReference in an inline datum, or sum the required payments over all script inputs, or restrict to one script input. The Cancel branch is correct (seller signature). Acceptable secondary findings at Low/Info: price is not checked to be positive, and listing UTxOs are not authenticated (#19); neither replaces #1 as the main finding."
+}
