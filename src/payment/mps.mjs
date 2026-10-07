@@ -62,10 +62,11 @@ export function validateRegistration(value) {
  * Everything the worker needs to request one payment, with no network calls.
  * @param {{task: {taskId: string, name: string, description: string | null}, registration: unknown, tier: string, now?: number | Date}} options
  */
-export function buildPaymentPlan({ task, registration, tier, now = Date.now() }) {
+export function buildPaymentPlan({ task, registration, tier, amount: priced, now = Date.now() }) {
   const reg = validateRegistration(registration);
   const input = paymentTask(task);
-  const { amount } = getTier(tier);
+  // A size-based price can replace the tier's fixed amount.
+  const amount = priced ?? getTier(tier).amount;
   const identifierFromPurchaser = makeNonce(input, reg.agentIdentifier);
   return { tier, amount, unit: USDM_PREPROD, agentIdentifier: reg.agentIdentifier,
     supportedPaymentSourceIndex: reg.supportedPaymentSourceIndex, identifierFromPurchaser,

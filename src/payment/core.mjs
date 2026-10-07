@@ -67,13 +67,15 @@ function coreError(error, action) {
 export function scopeCoreClient(http) {
   return {
     /** @param {string} taskId @param {object} masumiPayment the object from buildMasumiPaymentEvent */
-    async postPaymentEvent(taskId, masumiPayment) {
+    async postPaymentEvent(taskId, masumiPayment, comment) {
       safeId(taskId);
       if (!masumiPayment || typeof masumiPayment !== 'object' || 'masumiPayment' in masumiPayment)
         throw new Error('Pass the inner masumiPayment object, not a wrapped event');
       let result;
+      // The optional comment shows the buyer why this price was asked.
+      const body = comment ? { comment, masumiPayment } : { masumiPayment };
       try {
-        result = await http.post(`/v1/tasks/${taskId}/events`, { masumiPayment }, AbortSignal.timeout(REQUEST_TIMEOUT_MS));
+        result = await http.post(`/v1/tasks/${taskId}/events`, body, AbortSignal.timeout(REQUEST_TIMEOUT_MS));
       } catch (error) { throw coreError(error, 'payment event'); }
       const event = result?.data;
       if (typeof event?.id !== 'string' || !event.id || (event.taskId !== undefined && event.taskId !== taskId))

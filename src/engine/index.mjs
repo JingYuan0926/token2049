@@ -14,11 +14,25 @@ export function hashFiles(files) {
   return hash.digest('hex');
 }
 
-export async function runAudit({ tier, source, jobId = randomUUID(), buyerNotes = '', proof, humanReview, log = () => {} }) {
-  log(`Preparing workspace (${source.kind})`);
+// The cheap first look, before any payment: fetch the code, find the Aiken project,
+// and read its sources. No model call.
+export async function inspectContract({ source, jobId = randomUUID() }) {
   const workspace = await prepareWorkspace(source, jobId);
   const files = collectSources(workspace.root);
-  const inputHash = hashFiles(files);
+  return { workspace, files, inputHash: hashFiles(files) };
+}
+
+// Pass `workspace` from an earlier inspectContract call to reuse the same files.
+export async function runAudit({ tier, source, jobId = randomUUID(), buyerNotes = '', proof, humanReview, workspace: prepared, log = () => {} }) {
+  log(`Preparing workspace (${prepared ? 'reused' : source.kind})`);
+  let workspace, files, inputHash;
+  if (prepared) {
+    workspace = prepared;
+    files = collectSources(workspace.root);
+    inputHash = hashFiles(files);
+  } else {
+    ({ workspace, files, inputHash } = await inspectContract({ source, jobId }));
+  }
 
   log('Running aiken check');
   const check = await runAikenCheck(workspace.root);

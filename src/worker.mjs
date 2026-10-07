@@ -6,14 +6,14 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseTaskInput } from './engine/input.mjs';
-import { runAudit } from './engine/index.mjs';
+import { inspectContract, runAudit } from './engine/index.mjs';
 import { renderReport } from './engine/report.mjs';
 import { MODEL } from './engine/review.mjs';
 import { buildMasumiPaymentEvent, createCoreClient, loadSokosumiRuntime } from './payment/core.mjs';
 import { isFundsLockedConfirmed, isResultAccepted, isWithdrawn, resultDeadlinePassed, withdrawalTxHash } from './payment/flow.mjs';
 import { hashPaymentResult } from './payment/hash.mjs';
 import { buildPaymentPlan, createMpsClient, validateQuote } from './payment/mps.mjs';
-import { getTier } from './payment/tiers.mjs';
+import { quote as priceJob, quoteMessage } from './payment/pricing.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const LOCAL = resolve(here, '../.local');
@@ -56,7 +56,7 @@ function complete(id, state, text) {
 function proofSection(state) {
   if (!state.payment) return null;
   const p = state.payment;
-  const amount = Number(getTier(state.tier).amount) / 1e6;
+  const amount = Number(state.plan.amount) / 1e6;
   return [
     `- **Payment:** ${amount} test USDM, locked in the Masumi escrow contract on Cardano Preprod.`,
     `- **Escrow transaction:** [${p.escrowTxHash.slice(0, 16)}…](${SCAN}${p.escrowTxHash})`,
@@ -82,12 +82,21 @@ async function startTask(task) {
     complete(id, load(id), `# Aiken Auditor: no audit started\n\n${error.message}\n\nNo payment was taken. Create a new task with the contract and a tier line, for example \`tier: see\`.\n`);
     return;
   }
-  save(id, { phase: 'started', task: info, tier: parsed.tier, source: parsed.source });
-  log(id, `started, tier ${parsed.tier}, ${parsed.source.kind}`);
+  let inspection;
+  try {
+    const { workspace, files } = await inspectContract({ source: parsed.source, jobId: id });
+    inspection = { workspace, price: priceJob({ tier: parsed.tier, files }) };
+  } catch (error) {
+    save(id, { phase: 'started', task: info });
+    complete(id, load(id), `# Aiken Auditor: no audit started\n\n${error.message}\n\nNo payment was taken.\n`);
+    return;
+  }
+  save(id, { phase: 'started', task: info, tier: parsed.tier, source: parsed.source, ...inspection });
+  log(id, `started, tier ${parsed.tier}, ${parsed.source.kind}, ${inspection.price.lines} lines -> ${inspection.price.usdm} USDM`);
 }
 
 async function requestPayment(id, state) {
-  const plan = buildPaymentPlan({ task: { taskId: id, name: state.task.name, description: state.task.description }, registration, tier: state.tier });
+  const plan = buildPaymentPlan({ task: { taskId: id, name: state.task.name, description: state.task.description }, registration, tier: state.tier, amount: state.price.amount });
   save(id, { ...state, phase: 'quote-pending', plan });
   // A clear rejection (not an unknown outcome) means no money moved: close the Task.
   const noCharge = (error) => {
@@ -104,7 +113,7 @@ async function requestPayment(id, state) {
   const next = { ...state, plan, quote, phase: 'event-pending' };
   save(id, next);
   let eventId;
-  try { eventId = await core.postPaymentEvent(id, event); } catch (error) { return noCharge(error); }
+  try { eventId = await core.postPaymentEvent(id, event, quoteMessage(state.tier, state.price)); } catch (error) { return noCharge(error); }
   save(id, { ...next, phase: 'awaiting-escrow', paymentEventId: eventId });
   log(id, `payment requested (${Number(plan.amount) / 1e6} USDM)`);
 }
@@ -123,7 +132,7 @@ async function checkEscrow(id, state) {
 
 async function audit(id, state) {
   if (state.quote && resultDeadlinePassed(state.quote)) throw new Error('The result deadline passed before the audit started.');
-  const result = await runAudit({ tier: state.tier, source: state.source, jobId: id, buyerNotes: state.task.description ?? '', log: (m) => log(id, m) });
+  const result = await runAudit({ tier: state.tier, source: state.source, jobId: id, workspace: state.workspace, buyerNotes: state.task.description ?? '', log: (m) => log(id, m) });
   const renderArgs = {
     tier: state.tier, label: result.workspace.label, inputHash: result.inputHash, model: MODEL, date: new Date().toISOString(),
     files: result.files, check: result.check, review: result.review, fix: result.fix,
