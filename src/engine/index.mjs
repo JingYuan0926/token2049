@@ -37,7 +37,8 @@ export async function runAudit({ tier, source, jobId = randomUUID(), buyerNotes 
   log('Running aiken check');
   const check = await runAikenCheck(workspace.root);
 
-  log(`Reviewing with ${MODEL}`);
+  log(`Build: ${check.ok ? 'compiles' : 'does not compile'}, ${check.passed}/${check.tests} tests passed`);
+  log(`Reviewing ${files.length} file(s) against 32 Cardano attack types`);
   const { data: review, usage } = await reviewContract({ tier, files, check, buyerNotes });
   const usages = [usage];
 
