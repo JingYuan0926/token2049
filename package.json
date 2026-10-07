@@ -1,0 +1,19 @@
+{
+  "name": "aiken-auditor",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "audit": "node --env-file-if-exists=.env src/cli/audit.mjs",
+    "worker": "node --env-file-if-exists=.env --env-file-if-exists=.local/mps-runtime.env src/worker.mjs",
+    "review": "node --env-file-if-exists=.env src/cli/review.mjs",
+    "test": "node --env-file-if-exists=.env --test 'test/*.test.mjs'",
+    "eval": "node --env-file-if-exists=.env src/cli/eval.mjs"
+  },
+  "dependencies": {
+    "openai": "^7.30.0",
+    "zod": "^4.6.5"
+  }
+}
