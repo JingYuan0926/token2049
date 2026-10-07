@@ -25,11 +25,21 @@ Built for the TOKEN2049 Origins Hackathon 2026, track "Agentic Payments on Carda
    Instead of code, you can also give a public GitHub link to an Aiken project.
 4. Wait a few minutes. The task completes with the report.
 
-| Tier | Price | You get | Delivery |
+| Tier | You get | Delivery |
+| --- | --- | --- |
+| `see` | Findings report | about 2 to 5 minutes |
+| `write` | Report and fixed code that compiles and passes `aiken check` | about 5 minutes |
+| `audit` | Report checked and signed by a human reviewer | within 24 hours |
+
+The agent first looks at the contract and posts the price in the task, before you pay. The price depends on the contract size (code lines in `validators/` and `lib/`) and the tier:
+
+| Size | `see` | `write` | `audit` |
 | --- | --- | --- | --- |
-| `see` | 1 test USDM | Findings report | about 2 to 5 minutes |
-| `write` | 5 test USDM | Report and fixed code that compiles and passes `aiken check` | about 5 minutes |
-| `audit` | 20 test USDM | Report checked and signed by a human reviewer | within 24 hours |
+| Small (up to 150 lines) | 0.5 test USDM | 1.5 | 5 |
+| Medium (up to 400 lines) | 1 | 3 | 10 |
+| Large (more than 400 lines) | 1.5 | 4.5 | 15 |
+
+With a GitHub link, the agent searches the repository for the Aiken project (an `aiken.toml` next to a `validators` folder). Try it with this repository: its `demo/` folder holds one correct validator and one with a hidden flaw.
 
 Describe what the contract is meant to do. The agent judges each finding against that intent.
 
