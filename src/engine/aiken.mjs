@@ -84,6 +84,7 @@ function dirBytes(dir) {
   let total = 0;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
+    if (entry.isSymbolicLink()) throw new Error(`The repository contains a symbolic link (${entry.name}). Links are not allowed.`);
     if (entry.isDirectory()) total += dirBytes(path);
     else total += statSync(path).size;
   }
@@ -99,7 +100,8 @@ export async function prepareWorkspace(source, jobId) {
     writeFileSync(join(dir, 'validators/contract.ak'), `${source.code.trim()}\n`);
     return { dir, root: dir, label: 'validators/contract.ak (pasted code)' };
   }
-  const args = ['clone', '--depth', '1', '--quiet'];
+  // core.symlinks=false: a link in the repo becomes a plain text file, never a pointer.
+  const args = ['-c', 'core.symlinks=false', 'clone', '--depth', '1', '--quiet'];
   if (source.ref) args.push('--branch', source.ref);
   args.push(source.url, dir);
   await run('git', args, { timeout: 90_000, env: { ...AIKEN_ENV, GIT_TERMINAL_PROMPT: '0' } });
@@ -144,6 +146,7 @@ export function collectSources(root) {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       if (entry.name === 'build' || entry.name.startsWith('.')) continue;
       const path = join(dir, entry.name);
+      if (entry.isSymbolicLink()) throw new Error(`The contract contains a symbolic link (${entry.name}). Links are not allowed.`);
       if (entry.isDirectory()) walk(path);
       else if (entry.name.endsWith('.ak')) {
         const content = readFileSync(path, 'utf8');

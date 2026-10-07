@@ -68,6 +68,23 @@ function proofSection(state) {
 }
 
 const running = new Set();
+const commentChains = new Map();
+
+// Posts a short progress comment to the buyer's task.
+function notify(id, text) {
+  const next = (commentChains.get(id) ?? Promise.resolve())
+    .then(() => coworkerHttp.post(`/v1/tasks/${id}/events`, { comment: text }, AbortSignal.timeout(20_000)))
+    .catch((error) => log(id, `progress comment failed: ${String(error.message).slice(0, 120)}`));
+  commentChains.set(id, next);
+  return next;
+}
+
+const PROGRESS = [
+  [/^Running aiken check/, () => '🔨 Building your contract with `aiken check`…'],
+  [/^Build: /, (m) => `🔨 ${m.replace('Build: ', 'Build done: ')}.`],
+  [/^Reviewing /, (m) => `🔍 ${m.replace('Reviewing', 'Checking')}…`],
+  [/^Writing a fix/, (m) => `✍️ ${m}…`],
+];
 
 async function startTask(task) {
   const id = task.id;
@@ -125,6 +142,7 @@ async function checkEscrow(id, state) {
       : resolved.TransactionHistory.find((t) => t.newOnChainState === 'FundsLocked' && t.status === 'Confirmed');
     save(id, { ...state, phase: 'auditing', payment: { escrowTxHash: tx.txHash, nonce: state.plan.identifierFromPurchaser, inputHash: state.plan.inputHash } });
     log(id, `escrow locked ${tx.txHash}`);
+    notify(id, `✅ Payment locked in Masumi escrow on Cardano: ${SCAN}${tx.txHash} — starting the audit.`);
   } else if (Date.now() > Number(state.quote.payByTime)) {
     complete(id, state, '# Aiken Auditor: payment did not arrive\n\nThe escrow was not funded before the payment deadline, so no audit ran and nothing was charged. Please create a new task.\n');
   }
@@ -132,7 +150,11 @@ async function checkEscrow(id, state) {
 
 async function audit(id, state) {
   if (state.quote && resultDeadlinePassed(state.quote)) throw new Error('The result deadline passed before the audit started.');
-  const result = await runAudit({ tier: state.tier, source: state.source, jobId: id, workspace: state.workspace, buyerNotes: state.task.description ?? '', log: (m) => log(id, m) });
+  const result = await runAudit({ tier: state.tier, source: state.source, jobId: id, workspace: state.workspace, buyerNotes: state.task.description ?? '', log: (m) => {
+    log(id, m);
+    const match = PROGRESS.find(([re]) => re.test(m));
+    if (match) notify(id, match[1](m));
+  } });
   const renderArgs = {
     tier: state.tier, label: result.workspace.label, inputHash: result.inputHash, model: MODEL, date: new Date().toISOString(),
     files: result.files, check: result.check, review: result.review, fix: result.fix,
@@ -159,6 +181,7 @@ async function deliver(id, state) {
   if (!PAID) return complete(id, state, report);
   if (resultDeadlinePassed(state.quote)) throw new Error('The result deadline passed. The escrow will refund the buyer.');
   const resultHash = hashPaymentResult(state.payment.nonce, report);
+  notify(id, '⛓️ Report ready. Writing its hash on Cardano, then I deliver it here…');
   writeFileSync(join(TASKS, `${id}.result.md`), report, { mode: 0o600 });
   save(id, { ...state, phase: 'submit-pending', resultHash });
   await mps.submitResult(state.quote.blockchainIdentifier, resultHash);
